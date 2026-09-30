@@ -39,14 +39,26 @@ $CONVERGENCE next-action "$LEDGER"     # what the ledger requires of you, right 
 
 Run that whenever you are unsure. It is derived state, not advice.
 
+`status` prints the whole derived state as a **flat JSON object at the top level** — no
+`state` wrapper. It is meant for scripts and for `grep`; do not paste it into a prompt on a
+large run, it grows with the ledger. Use `next-action` and `close` when you want to read.
+
+The ledger lives inside the working repo because that is where the evidence lives. Add
+`.omc/convergence/` to `.gitignore` unless the audit trail is meant to ship with the
+change; `report.md` is the human artefact, the four `.jsonl` files are the machine record.
+
 ## Start
 
 ```bash
 $CONVERGENCE init "$LEDGER" \
   --intent "what outcome is actually wanted" \
-  --criterion "an observable, independently checkable claim" \
-  --criterion "another one"
+  --criterion "an observable claim" "another one" "and a third"
 ```
+
+`--criterion` is repeatable and takes several values per flag. Every fork option is one
+JSON object per `--option`, requiring `id`, `cost`, `risk` and `reversibility`; an
+optional `note` carries the argument *for* that option, which is usually what a challenger
+needs to rebut it.
 
 Criteria are the unit of verification. Each one must be closeable by a command someone
 else could re-run. If you cannot name the command, the criterion is not a criterion yet.
@@ -84,8 +96,10 @@ $CONVERGENCE open-hypothesis "$LEDGER" --id H1 --incident INC-1 \
 ```
 
 At least three, before any fix is permitted (`--search full`, the default). One plausible
-idea anchoring the whole investigation is the failure mode, and restating the same claim
-twice is refused — the ledger is a search, not a pad.
+idea anchoring the whole investigation is the failure mode, and padding the ledger is
+refused: not just identical claims, but any claim in the same incident sharing at least
+70% of the other's content words. The refusal names the shared terms, so if two claims
+really are different mechanisms, say what distinguishes them.
 
 A hypothesis you cannot state a prediction for is a vibe. Discard or sharpen it.
 
@@ -202,6 +216,24 @@ If your decision departs from `--assumed`, `--invalidated` is mandatory. Name th
 tests, acceptance criteria and PRD stories the dead assumption made stale. Silence here is
 how work ends up shipped on top of an assumption nobody noticed died.
 
+### When the dispute wins against you
+
+If the challenger's objection did not hold, say so out loud and price it:
+
+```bash
+$CONVERGENCE decide "$LEDGER" --fork F1 --chosen sqs --by agent \
+  --invalidated "US-004" \
+  --challenger-overruled --override-reason "the counter-example did not reproduce at 16/4"
+```
+
+`--challenger-overruled` without a reason is refused. Overriding a dispute is allowed;
+overriding it silently is the thing this ledger exists to prevent. It also costs the run
+its clean `COMPLETE`.
+
+The converse matters too: a dispute the challenger ran and the evidence then settled does
+**not** downgrade the verdict. The status tracks the quality of the decision, not how many
+forks the run happened to hit. An agent may legitimately reach `COMPLETE`.
+
 ## B4. Resume
 
 Everything above is append-only. After a crash, a compaction, or a session change, the
@@ -282,10 +314,16 @@ $CONVERGENCE record-evidence "$LEDGER" --criterion "handles CRLF" \
 `--expected-source` is the anti-tautology control. The expectation must come from
 somewhere other than the implementation:
 
-| value | meaning |
+| value | use it when the expected value is |
 |---|---|
-| `spec`, `literal`, `worked_example`, `independent_oracle` | acceptable |
+| `literal` | a fixed value you can write down: exit code `1` on denial, exactly 5 rows, an exact string |
+| `spec` | an acceptance criterion in the spec or a PRD story |
+| `worked_example` | a hand-worked case, e.g. a window of 3 with limit 2 admits 2 then denies |
+| `independent_oracle` | computed by something that is not the code under test: a second implementation, a database constraint, a third-party client |
 | `code` | **refused** — recomputing the expected value the way the code does makes the check pass by construction and lets it never disagree with the bug |
+
+When two labels both fit, ask what would still hold if the code were wrong. If the answer
+is nothing, it is `code`.
 
 **Evidence is not documentation.** A diff, a screenshot, a summary table, or a reviewer's
 opinion is not a tier. Name the command.
@@ -321,9 +359,10 @@ fail, the information was absent. Do not "fix" that by reporting it any other wa
 Read this as a list of arguments you cannot win. Each is a test.
 
 - a hypothesis with no declared-and-run red-capable loop for its incident
-- a hypothesis whose claim restates one already recorded
+- a hypothesis whose claim restates or paraphrases one already recorded on that incident
 - a refutation or a survival with no probe and no observation
-- a fix while any hypothesis on the incident is `open`, or with fewer than three tested
+- a fix while any hypothesis on the incident is `open`, or with fewer rivals settled than
+  the declared `--search` width
 - any action other than rebuilding the loop, after `loop_defective`
 - any action other than settling a hypothesis, after `hypothesis_unresolved`
 - a new line of attack while a hypothesis is `open`
@@ -334,6 +373,9 @@ Read this as a list of arguments you cannot win. Each is a test.
 - an agent decision that is irreversible, or touches a human anchor
 - a human decision without acknowledgement
 - a decision that departs from the plan but invalidates nothing
+- `--challenger-overruled` without a reason
+- an unknown `--search` width
+- a malformed fork option that is not a dict
 - an expectation computed from the code
 - a reproduction credited to the same actor who recorded it
 - `unavailable` without a reason

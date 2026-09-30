@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -52,6 +53,30 @@ EXPECTED_SOURCES = ("spec", "literal", "worked_example", "independent_oracle", "
 #: A fix may not be written before this many distinct hypotheses have been tested.
 #: One plausible idea anchoring the whole investigation is the failure mode.
 MIN_HYPOTHESES = 3
+
+#: Two claims in the SAME incident whose content words overlap at least this much are
+#: treated as the same hypothesis. String equality cannot stop paraphrase, and paraphrase
+#: is how a ledger gets padded to satisfy a minimum. The check is scoped to one incident
+#: because padding happens inside one investigation; unrelated incidents legitimately
+#: share a defect class and a phrasing.
+CLAIM_OVERLAP_THRESHOLD = 0.7
+
+_STOPWORDS = frozenset(
+    "a an the is are was were be been being in of to it its and or for on that this "
+    "with from by not has have had does do did when if at as we you they he she".split()
+)
+
+
+def _claim_words(claim):
+    return {w for w in re.findall(r"[a-z0-9]+", claim.lower()) if len(w) > 2 and w not in _STOPWORDS}
+
+
+def _overlap(a, b):
+    ka, kb = _claim_words(a), _claim_words(b)
+    if not ka or not kb:
+        return 0.0
+    return len(ka & kb) / len(ka | kb)
+
 
 #: Rival explanations that must be settled before a fix, by declared search width.
 #: `narrow` is not a bypass: it is recorded on the fix, and it costs the run its clean
@@ -320,6 +345,8 @@ def _ev_decide(s, ev):
         "anchors": ev.get("anchors") or [],
         "invalidated": ev.get("invalidated") or [],
         "rationale": ev.get("rationale"),
+        "challenger_overruled": ev.get("challenger_overruled", False),
+        "override_reason": ev.get("override_reason"),
         "at": ev["at"],
     }
 
@@ -502,10 +529,21 @@ class Ledger:
         prediction = req(prediction, "--prediction")
         self._require_ran_red_loop(incident)
         for existing in self.state["hypotheses"].values():
+            if existing["incident"] != incident:
+                continue
             if existing["claim"].strip().lower() == claim.strip().lower():
                 raise Blocked(
                     f"hypothesis already recorded: {existing['id']!r} states the same claim. "
                     f"Padding the ledger with restatements defeats the search."
+                )
+            overlap = _overlap(existing["claim"], claim)
+            if overlap >= CLAIM_OVERLAP_THRESHOLD:
+                shared = sorted(_claim_words(existing["claim"]) & _claim_words(claim))
+                raise Blocked(
+                    f"hypothesis {existing['id']!r} is {overlap:.0%} the same claim as this one "
+                    f"(shared terms: {', '.join(shared)}). String equality does not stop "
+                    f"paraphrase, so content overlap is checked instead. If these are really "
+                    f"different mechanisms, say what distinguishes them."
                 )
         self._append(
             "hypotheses",
@@ -702,6 +740,8 @@ class Ledger:
         anchors=(),
         invalidated=(),
         rationale=None,
+        challenger_overruled=False,
+        override_reason=None,
     ):
         fork = req(fork, "--fork")
         record = self.state["forks"].get(fork)
@@ -749,6 +789,12 @@ class Ledger:
                 f"{chosen!r}) but records nothing invalidated. Name the work, tests, "
                 f"acceptance criteria and PRD stories that the old assumption made stale."
             )
+        if challenger_overruled and not str(override_reason or "").strip():
+            raise UsageError(
+                "--challenger-overruled requires --override-reason saying why the "
+                "challenger's objection does not hold. Overriding a dispute is allowed; "
+                "overriding it silently is the thing this ledger exists to prevent."
+            )
         self._append(
             "forks",
             {
@@ -761,6 +807,8 @@ class Ledger:
                 "anchors": anchors,
                 "invalidated": [str(i) for i in invalidated if str(i).strip()],
                 "rationale": rationale,
+                "challenger_overruled": bool(challenger_overruled),
+                "override_reason": override_reason,
             },
         )
         return self
@@ -848,7 +896,9 @@ class Ledger:
             if c not in covered and any(e["criterion"] == c for e in s["evidence"])
         }
         uncovered = [c for c in s["criteria"] if c not in covered and c not in unavailable_only]
-        autonomous = sorted(f for f, d in s["decisions"].items() if d["by"] == "agent")
+        overruled = sorted(
+            f for f, d in s["decisions"].items() if d.get("challenger_overruled")
+        )
         nonterminal = [c for c in s["classifications"] if c["kind"] != "information_missing"]
 
         blocks = []
@@ -886,8 +936,11 @@ class Ledger:
         risks = []
         if unavailable_only:
             risks.append(f"criteria verified only as unavailable: {sorted(unavailable_only)}")
-        if autonomous:
-            risks.append(f"forks decided autonomously, not by a human: {autonomous}")
+        if overruled:
+            risks.append(
+                f"the challenger's objection was overruled on {overruled}: "
+                f"{[s['decisions'][f].get('override_reason') for f in overruled]}"
+            )
         if nonterminal:
             risks.append(
                 "repeated non-convergence kept this run alive past its own diagnosis: "
@@ -1147,6 +1200,10 @@ def _build_parser():
     node.add_argument("--anchor", action="extend", nargs="+", default=[])
     node.add_argument("--invalidated", action="extend", nargs="+", default=[])
     node.add_argument("--rationale")
+    node.add_argument("--challenger-overruled", action="store_true",
+                      help="the dispute's objection did not hold; requires --override-reason "
+                           "and downgrades the final verdict to COMPLETE WITH RISKS")
+    node.add_argument("--override-reason")
 
     node = add("record-evidence", "record a verification result")
     node.add_argument("--criterion", required=True)
@@ -1231,6 +1288,8 @@ def _dispatch(args):
             anchors=args.anchor,
             invalidated=args.invalidated,
             rationale=args.rationale,
+            challenger_overruled=args.challenger_overruled,
+            override_reason=args.override_reason,
         )
     elif command == "record-evidence":
         ledger.record_evidence(

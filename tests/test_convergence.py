@@ -155,7 +155,9 @@ def test_a_huge_ledger_still_produces_a_readable_report(led):
         inc = f"BULK-{i:03d}"
         led.declare_loop(inc, f"pytest -k b{i}", "bulk failure")
         led.run_loop(inc, red=True)
-        led.open_hypothesis(f"B{i}", inc, f"mechanism {i}", f"isolating {i} goes green")
+        unique = inc.replace("-", "")
+        led.open_hypothesis(f"B{i}", inc, f"the retry budget for {unique} is unset",
+                            f"setting {unique} goes green")
         led.close_hypothesis(f"B{i}", "probe", "green", survives=True)
         led.begin_fix(inc, f"fix {i}", search="narrow")
     report = led.report()
@@ -492,16 +494,14 @@ def test_an_undecided_fork_blocks_an_otherwise_complete_run(led):
     assert led.outcome()[0] == "BLOCKED"
 
 
-def test_an_agent_decided_fork_downgrades_the_final_verdict(led):
+def test_the_verdict_tracks_the_dispute_not_the_fork_count(led):
+    """A converged dispute must not make a clean COMPLETE unreachable."""
     settled(led)
-    led.record_evidence("handles CRLF", "pytest -k crlf", "executed_here")
-    led.record_evidence("rejects malformed", "pytest -k malformed", "executed_here")
+    verified(led)
     led.open_fork("F1", "which queue?", "broker gone", "redis", fork_options("sqs", "nats"))
     led.dispute("F1", challenger="reviewer", author="main", steelman="nats is better but unstaffed")
     led.decide("F1", "sqs", by="agent", invalidated=["US-004"])
-    status, reasons = led.outcome()
-    assert status == "COMPLETE WITH RISKS"
-    assert any("F1" in r for r in reasons)
+    assert led.outcome() == ("COMPLETE", [])
 
 
 def test_a_blocking_risk_prevents_completion(led):
@@ -716,3 +716,49 @@ def test_a_malformed_option_is_a_refusal_not_a_crash(led):
         with pytest.raises(UsageError, match="must be a dict"):
             led.open_fork("F1", "q", "t", "redis", [bad])
     assert led.state["forks"] == {}
+
+
+def test_a_paraphrased_claim_is_refused_not_just_an_exact_copy(led):
+    armed(led)
+    led.open_hypothesis("H1", INCIDENT, "the null guard is missing", "adding it goes green")
+    with pytest.raises(Blocked, match="String equality does not stop"):
+        led.open_hypothesis("H2", INCIDENT, "the missing null guard", "removing it brings it back")
+    assert "H2" not in led.state["hypotheses"]
+
+
+def test_genuinely_distinct_mechanisms_still_get_in(led):
+    armed(led)
+    led.open_hypothesis("H1", INCIDENT, "the file is opened in text mode", "binary mode goes green")
+    led.open_hypothesis("H2", INCIDENT, "a dependency upgrade changed the parser", "pinning it restores")
+    led.open_hypothesis("H3", INCIDENT, "the clock skews the window boundary", "a frozen clock fixes it")
+    assert len(led.state["hypotheses"]) == 3
+
+
+def test_overruling_the_challenger_needs_a_reason(led):
+    led.open_fork("F1", "which queue?", "broker gone", "redis", fork_options("sqs", "nats"))
+    led.dispute("F1", challenger="rev", author="main", steelman="nats is better")
+    with pytest.raises(UsageError, match="--override-reason"):
+        led.decide("F1", "sqs", by="agent", invalidated=["US-1"], challenger_overruled=True)
+
+
+def test_a_converged_dispute_still_allows_a_clean_complete(led):
+    """The verdict must track the work's quality, not how many forks the run hit."""
+    settled(led)
+    verified(led)
+    led.open_fork("F1", "which queue?", "broker gone", "redis", fork_options("sqs", "nats"))
+    led.dispute("F1", challenger="rev", author="main", steelman="nats is better, but unstaffed")
+    led.decide("F1", "sqs", by="agent", invalidated=["US-1"])
+    assert led.outcome() == ("COMPLETE", [])
+
+
+def test_overruling_the_challenger_costs_the_clean_verdict(led):
+    settled(led)
+    verified(led)
+    led.open_fork("F1", "which queue?", "broker gone", "redis", fork_options("sqs", "nats"))
+    led.dispute("F1", challenger="rev", author="main", steelman="nats is measurably better")
+    led.decide("F1", "sqs", by="agent", invalidated=["US-1"],
+                challenger_overruled=True, override_reason="the counter-example did not reproduce")
+    status, reasons = led.outcome()
+    assert status == "COMPLETE WITH RISKS"
+    assert any("objection was overruled" in r for r in reasons)
+    assert "did not reproduce" in " ".join(reasons)
