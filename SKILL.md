@@ -83,9 +83,9 @@ $CONVERGENCE open-hypothesis "$LEDGER" --id H1 --incident INC-1 \
   --prediction "opening it in binary mode makes the loop go green"
 ```
 
-At least three, before any fix is permitted. One plausible idea anchoring the whole
-investigation is the failure mode, and restating the same claim twice is refused — the
-ledger is a search, not a pad.
+At least three, before any fix is permitted (`--search full`, the default). One plausible
+idea anchoring the whole investigation is the failure mode, and restating the same claim
+twice is refused — the ledger is a search, not a pad.
 
 A hypothesis you cannot state a prediction for is a vibe. Discard or sharpen it.
 
@@ -107,9 +107,30 @@ convergence is a finding, and it shrinks the space.
 $CONVERGENCE begin-fix "$LEDGER" --incident INC-1 --note "open in binary mode and strip the BOM"
 ```
 
-Refused while any hypothesis on the incident is `open`, or with fewer than three tested.
-A fix chosen before its rivals are refuted is a guess, and the gate is not interested in
-your confidence.
+Refused while any hypothesis on the incident is `open`, or with fewer rivals settled than
+the declared search width. A fix chosen before its rivals are refuted is a guess, and the
+gate is not interested in your confidence.
+
+### Small, fully reproduced defects
+
+Three rivals is theatre for a one-line null check whose mechanism is already pinned by a
+red loop. That is not an excuse to skip the ledger — it is a different, *declared* search
+width, and it is priced:
+
+```bash
+$CONVERGENCE begin-fix "$LEDGER" --incident INC-1 --note "add the null guard" --search narrow
+```
+
+`narrow` requires one settled explanation. It is recorded on the fix, shown in the report,
+and it costs the run its clean `COMPLETE`: the run closes as `COMPLETE WITH RISKS`, naming
+that the fix was chosen without searching over rivals. Use it when the defect is fully
+reproduced and you can say in one sentence why the mechanism is not in doubt. Use `full`
+the moment that sentence would be a guess.
+
+The minimal honest sequence for a small change is therefore four commands: `init`,
+`declare-loop`, `run-loop`, then `open-hypothesis` → `refute`/`survive` → `begin-fix
+--search narrow` → `record-evidence` → `close`. Never fewer: a run with no ledger has no
+machine, and no machine means no gate.
 
 ---
 

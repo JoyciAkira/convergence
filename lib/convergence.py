@@ -53,6 +53,25 @@ EXPECTED_SOURCES = ("spec", "literal", "worked_example", "independent_oracle", "
 #: One plausible idea anchoring the whole investigation is the failure mode.
 MIN_HYPOTHESES = 3
 
+#: Rival explanations that must be settled before a fix, by declared search width.
+#: `narrow` is not a bypass: it is recorded on the fix, and it costs the run its clean
+#: COMPLETE. For a small, fully reproduced defect whose mechanism is unambiguous,
+#: demanding three rivals is theatre — but theatre the agent has to pay for out loud.
+SEARCH_WIDTH = {"narrow": 1, "full": MIN_HYPOTHESES}
+
+#: Rows rendered per report section before the report points at the ledger instead.
+REPORT_ROW_CAP = 12
+
+
+def rows(items, pointer="the ledger logs", cap=REPORT_ROW_CAP):
+    """Cap a section so a 3,000-event run does not produce an unreadable document."""
+    items = list(items)
+    if not items:
+        return ["- None"]
+    if len(items) <= cap:
+        return items
+    return items[:cap] + [f"- …and {len(items) - cap} more; the full record is in {pointer}"]
+
 #: After a non-convergence classification, which actions satisfy it.
 #: `loop_defective` must permit the loop itself, or the directive is unsatisfiable:
 #: `hyp_open` is gated on a loop that has been declared and has run red.
@@ -235,7 +254,9 @@ def _ev_hyp_merge(s, ev):
 
 
 def _ev_fix_begin(s, ev):
-    s["fixes"][ev["incident"]] = {"note": ev["note"], "at": ev["at"]}
+    s["fixes"][ev["incident"]] = {
+        "note": ev["note"], "search": ev.get("search", "full"), "at": ev["at"],
+    }
 
 
 def _ev_classify(s, ev):
@@ -534,8 +555,10 @@ class Ledger:
         self._clear_directive("hyp_merge")
         return self
 
-    def begin_fix(self, incident, note):
+    def begin_fix(self, incident, note, search="full"):
         self._enforce_directive("begin_fix")
+        search = one_of(search, tuple(SEARCH_WIDTH), "--search")
+        required = SEARCH_WIDTH[search]
         tested = [h for h in self.state["hypotheses"].values() if h["incident"] == incident]
         if not tested:
             # Report the first missing step, not the arithmetic at the end of the ladder.
@@ -550,16 +573,22 @@ class Ledger:
                 f"cannot write a fix while {incident!r} still has open hypotheses: {open_ids}. "
                 f"Test them first — a fix chosen before its rivals are refuted is a guess."
             )
-        tested = [h for h in self.state["hypotheses"].values() if h["incident"] == incident]
-        if len(tested) < MIN_HYPOTHESES:
+        if len(tested) < required:
             raise Blocked(
-                f"only {len(tested)} hypothesis/hypotheses recorded for {incident!r}; "
-                f"at least {MIN_HYPOTHESES} distinct explanations must be tested before a fix. "
-                f"One plausible idea anchoring the whole investigation is the failure mode."
+                f"only {len(tested)} hypothesis/hypotheses settled for {incident!r}; "
+                f"--search {search} requires {required}. Test more rivals, or re-run with "
+                f"--search narrow if the defect is fully reproduced and its mechanism is "
+                f"unambiguous: the fix is then recorded as chosen without a search over "
+                f"rivals, and the run can no longer close as a clean COMPLETE."
             )
         self._append(
             "control",
-            {"ev": "fix_begin", "incident": incident, "note": req(note, "--note")},
+            {
+                "ev": "fix_begin",
+                "incident": incident,
+                "note": req(note, "--note"),
+                "search": search,
+            },
         )
         return self
 
@@ -601,9 +630,13 @@ class Ledger:
     def open_fork(self, ident, question, trigger, assumed, options, invalidation_rationale=None):
         options = list(options or [])
         if not options:
-            raise UsageError("a fork needs at least one --option (JSON per option)")
+            raise UsageError("a fork needs at least one option (a dict per option)")
         seen = set()
         for option in options:
+            # The gate is the validator. It must hold on the library path too, or a
+            # malformed option escapes as an AttributeError instead of a refusal.
+            if not isinstance(option, dict):
+                raise UsageError(f"each option must be a dict, got {type(option).__name__}: {option!r}")
             for field in ("id", "cost", "risk", "reversibility"):
                 if not str(option.get(field, "")).strip():
                     raise UsageError(f"option is missing {field!r}: {option!r}")
@@ -860,6 +893,12 @@ class Ledger:
                 "repeated non-convergence kept this run alive past its own diagnosis: "
                 + ", ".join(sorted({c["signature"] for c in nonterminal}))
             )
+        narrow = sorted(k for k, v in s["fixes"].items() if v.get("search") == "narrow")
+        if narrow:
+            risks.append(
+                "fixes chosen with --search narrow, i.e. without searching over rival "
+                f"explanations: {narrow}"
+            )
         risks.extend(f"risk: {r['text']}" for r in s["risks"] if not r["blocking"])
         if risks:
             return "COMPLETE WITH RISKS", risks
@@ -884,11 +923,11 @@ class Ledger:
         lines.append("")
 
         lines += ["## Work performed", ""]
-        if s["fixes"]:
-            for incident, fix in sorted(s["fixes"].items()):
-                lines.append(f"- `{incident}`: {fix['note']}")
-        else:
-            lines.append("_no fix recorded_")
+        fix_rows = [
+            f"- `{incident}`: {fix['note']} (search: {fix.get('search', 'full')})"
+            for incident, fix in sorted(s["fixes"].items())
+        ]
+        lines += rows(fix_rows, "`control.jsonl`") if fix_rows else ["_no fix recorded_"]
         lines.append("")
 
         lines += ["## Verification", ""]
@@ -899,46 +938,44 @@ class Ledger:
             ("Unavailable", sorted(unavailable)),
         ):
             lines.append(f"**{label}**")
-            lines += [f"- `{c}`" for c in criteria] or ["- None"]
+            lines += rows([f"- `{c}`" for c in criteria])
             lines.append("")
 
         lines += ["## Hypothesis ledger", ""]
-        if s["hypotheses"]:
-            for hyp in s["hypotheses"].values():
-                closed = f" -> {hyp['status']} by `{hyp['probe']}`" if hyp["probe"] else ""
-                lines.append(f"- `{hyp['id']}` [{hyp['status']}] {hyp['claim']}{closed}")
-        else:
-            lines.append("_none recorded_")
+        ledger_rows = []
+        for ident in sorted(s["hypotheses"]):
+            hyp = s["hypotheses"][ident]
+            closed = f" -> {hyp['status']} by `{hyp['probe']}`" if hyp["probe"] else ""
+            ledger_rows.append(f"- `{hyp['id']}` [{hyp['status']}] {hyp['claim']}{closed}")
+        lines += rows(ledger_rows, "`hypotheses.jsonl`")
         lines.append("")
 
         lines += ["## Challenger findings", ""]
-        if s["disputes"]:
-            for dispute in s["disputes"]:
-                verdict = f" verdict={dispute['verdict']}" if dispute.get("verdict") else ""
-                lines.append(
-                    f"- fork `{dispute['fork']}`: {dispute['challenger']} against "
-                    f"{dispute['author']}{verdict} — {dispute['steelman']}"
-                )
-        else:
-            lines.append("None found")
+        dispute_rows = [
+            f"- fork `{d['fork']}`: {d['challenger']} against {d['author']}"
+            + (f" verdict={d['verdict']}" if d.get("verdict") else "")
+            + f" — {d['steelman']}"
+            for d in s["disputes"]
+        ]
+        lines += rows(dispute_rows, "`forks.jsonl`") if dispute_rows else ["None found"]
         lines.append("")
 
         lines += ["## Conflicts and tradeoffs", ""]
-        if s["forks"]:
-            for fork_id, fork in sorted(s["forks"].items()):
-                decision = s["decisions"].get(fork_id)
-                if decision:
-                    lines.append(
-                        f"- `{fork_id}`: {fork['question']} -> chose "
-                        f"`{decision['chosen']}` ({decision['by']}"
-                        f"{', human-acknowledged' if decision['human_ack'] else ''})"
-                    )
-                    if decision["invalidated"]:
-                        lines.append(f"  invalidated: {', '.join(decision['invalidated'])}")
-                else:
-                    lines.append(f"- `{fork_id}`: {fork['question']} -> UNDECIDED")
-        else:
-            lines.append("None found")
+        fork_rows = []
+        for fork_id in sorted(s["forks"]):
+            fork = s["forks"][fork_id]
+            decision = s["decisions"].get(fork_id)
+            if not decision:
+                fork_rows.append(f"- `{fork_id}`: {fork['question']} -> UNDECIDED")
+                continue
+            fork_rows.append(
+                f"- `{fork_id}`: {fork['question']} -> chose `{decision['chosen']}` "
+                f"({decision['by']}"
+                f"{', human-acknowledged' if decision['human_ack'] else ''})"
+            )
+            if decision["invalidated"]:
+                fork_rows.append(f"  invalidated: {', '.join(decision['invalidated'])}")
+        lines += rows(fork_rows, "`forks.jsonl`") if fork_rows else ["None found"]
         lines.append("")
 
         lines += ["## Decay risks", ""]
@@ -962,7 +999,7 @@ class Ledger:
         lines.append("")
 
         lines += ["## Residual uncertainty", ""]
-        lines += [f"- {r}" for r in reasons] or ["None"]
+        lines += rows([f"- {r}" for r in reasons])
         lines.append("")
 
         lines += ["## Final status", "", f"**{status}**", ""]
@@ -1068,6 +1105,10 @@ def _build_parser():
     node = add("begin-fix", "open the fix gate for an incident")
     node.add_argument("--incident", required=True)
     node.add_argument("--note", required=True)
+    node.add_argument("--search", default="full", choices=tuple(SEARCH_WIDTH),
+                      help="full: search over rival explanations (default). "
+                           "narrow: the defect is fully reproduced and its mechanism is "
+                           "unambiguous; the run then cannot close as a clean COMPLETE.")
 
     node = add("classify", "classify a repeated failure signature")
     node.add_argument("--signature", required=True)
@@ -1162,7 +1203,7 @@ def _dispatch(args):
     elif command == "merge-hypotheses":
         ledger.merge_hypotheses(args.into, args.source, args.note)
     elif command == "begin-fix":
-        ledger.begin_fix(args.incident, args.note)
+        ledger.begin_fix(args.incident, args.note, search=args.search)
     elif command == "classify":
         ledger.classify(
             args.signature, args.kind, args.missing_fact, args.smallest_input, args.note

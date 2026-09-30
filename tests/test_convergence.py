@@ -107,7 +107,9 @@ def test_a_fix_needs_at_least_three_tested_explanations(led):
     armed(led)
     led.open_hypothesis("H1", INCIDENT, "newline mode", "mode would be 'r'")
     led.close_hypothesis("H1", "mode probe", "mode is 'r'", survives=True)
-    with pytest.raises(Blocked, match=f"at least {MIN_HYPOTHESES}"):
+    with pytest.raises(Blocked, match=f"--search full requires {MIN_HYPOTHESES}"):
+        led.begin_fix(INCIDENT, "open the file in binary mode")
+    with pytest.raises(Blocked, match="re-run with --search narrow"):
         led.begin_fix(INCIDENT, "open the file in binary mode")
 
 
@@ -120,6 +122,46 @@ def test_a_fix_is_refused_while_a_rival_is_untested(led):
     with pytest.raises(Blocked, match="open hypotheses: \\['H3'\\]"):
         led.begin_fix(INCIDENT, "binary mode")
     assert led.state["fixes"] == {}
+
+
+def test_a_narrow_search_is_permitted_but_priced(led):
+    armed(led)
+    led.open_hypothesis("H1", INCIDENT, "the guard is missing", "adding it goes green")
+    led.close_hypothesis("H1", "add the guard", "green", survives=True)
+    led.begin_fix(INCIDENT, "add the null guard", search="narrow")
+    assert led.state["fixes"][INCIDENT]["search"] == "narrow"
+    verified(led)
+    status, reasons = led.outcome()
+    assert status == "COMPLETE WITH RISKS"
+    assert any("without searching over rival" in r for r in reasons)
+
+
+def test_the_search_width_is_recorded_and_shown_in_the_report(led):
+    two_refuted(led)
+    led.open_hypothesis("H3", INCIDENT, "BOM handling", "stripping it fixes it")
+    led.close_hypothesis("H3", "BOM probe", "green", survives=True)
+    led.begin_fix(INCIDENT, "binary mode")
+    assert "(search: full)" in led.report()
+
+
+def test_an_unknown_search_width_is_refused(led):
+    two_refuted(led)
+    with pytest.raises(UsageError, match="--search"):
+        led.begin_fix(INCIDENT, "n", search="whatever")
+
+
+def test_a_huge_ledger_still_produces_a_readable_report(led):
+    for i in range(40):
+        inc = f"BULK-{i:03d}"
+        led.declare_loop(inc, f"pytest -k b{i}", "bulk failure")
+        led.run_loop(inc, red=True)
+        led.open_hypothesis(f"B{i}", inc, f"mechanism {i}", f"isolating {i} goes green")
+        led.close_hypothesis(f"B{i}", "probe", "green", survives=True)
+        led.begin_fix(inc, f"fix {i}", search="narrow")
+    report = led.report()
+    assert len(report) < 8000, f"report grew to {len(report)} bytes"
+    assert "more; the full record is in" in report
+    assert "`hypotheses.jsonl`" in report
 
 
 def test_three_settled_hypotheses_unlock_the_fix(led):
@@ -271,7 +313,7 @@ def fork_options(*ids):
 
 
 def test_a_fork_needs_options(led):
-    with pytest.raises(UsageError, match="at least one --option"):
+    with pytest.raises(UsageError, match="at least one option"):
         led.open_fork("F1", "which queue?", "the broker is gone", "redis", [])
 
 
@@ -667,3 +709,10 @@ def test_rebuilding_the_loop_lets_the_run_close(led):
     status, reasons = led.outcome()
     assert status in ("COMPLETE", "COMPLETE WITH RISKS")
     assert not any("defective" in r for r in reasons)
+
+
+def test_a_malformed_option_is_a_refusal_not_a_crash(led):
+    for bad in ("sqs", 42, None, ["sqs"]):
+        with pytest.raises(UsageError, match="must be a dict"):
+            led.open_fork("F1", "q", "t", "redis", [bad])
+    assert led.state["forks"] == {}
