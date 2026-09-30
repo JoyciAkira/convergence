@@ -279,8 +279,9 @@ $CONVERGENCE close "$LEDGER"     # writes report.md, prints it, exits 0 or 3
 
 The status is **derived**, never asserted, and follows a fixed precedence:
 
-1. **`FAILED VERIFICATION`** — a hypothesis is still untested, or a criterion was never
-   checked while nothing was blocking it.
+1. **`FAILED VERIFICATION`** — a hypothesis is still untested; a criterion was never
+   checked while nothing was blocking it; or a feedback loop you declared defective was
+   never rebuilt, in which case evidence gathered through it does not count.
 2. **`BLOCKED`** — a fork is undecided, a named fact is missing, or a blocking risk stands.
 3. **`COMPLETE WITH RISKS`** — everything required passed, but something was verified only
    as unavailable, or a fork was decided by an agent rather than a human, or the run had to
@@ -316,6 +317,7 @@ Read this as a list of arguments you cannot win. Each is a test.
 - a reproduction credited to the same actor who recorded it
 - `unavailable` without a reason
 - a ledger that was already initialised
+- a close while a `loop_defective` directive is still outstanding
 
 ## Anti-patterns
 

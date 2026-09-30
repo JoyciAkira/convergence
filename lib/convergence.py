@@ -54,8 +54,10 @@ EXPECTED_SOURCES = ("spec", "literal", "worked_example", "independent_oracle", "
 MIN_HYPOTHESES = 3
 
 #: After a non-convergence classification, which actions satisfy it.
+#: `loop_defective` must permit the loop itself, or the directive is unsatisfiable:
+#: `hyp_open` is gated on a loop that has been declared and has run red.
 DIRECTIVE_REQUIRES = {
-    "loop_defective": ("hyp_open",),
+    "loop_defective": ("declare_loop", "run_loop", "hyp_open"),
     "hypothesis_unresolved": ("hyp_refute", "hyp_survive", "hyp_merge"),
     "information_missing": (),
 }
@@ -215,8 +217,12 @@ def _ev_hyp_merge(s, ev):
     source = s["hypotheses"].get(ev["from"])
     if target is None or source is None:
         raise UsageError("merge needs an existing --into and --from hypothesis")
-    if source["status"] != "open":
-        raise Blocked(f"cannot merge {ev['from']!r}: it is already {source['status']}")
+    if target["status"] == "merged":
+        raise Blocked(f"cannot merge into {ev['into']!r}: it was itself merged elsewhere")
+    if source["status"] == "merged":
+        raise Blocked(f"cannot merge {ev['from']!r}: it was already merged into {source['merged_into']!r}")
+    if source["id"] == target["id"]:
+        raise Blocked(f"cannot merge {ev['from']!r} into itself")
     if source["claim"].strip().lower() == target["claim"].strip().lower():
         raise Blocked(
             f"merge is a no-op: {ev['from']!r} and {ev['into']!r} state the same claim"
@@ -247,6 +253,10 @@ def _ev_classify(s, ev):
         s["directive"] = None
     else:
         s["directive"] = {"kind": ev["kind"], "set_at": ev["at"]}
+
+
+def _ev_directive_clear(s, ev):
+    s["directive"] = None
 
 
 def _ev_resolve_block(s, ev):
@@ -322,6 +332,7 @@ _HANDLERS = {
     "hyp_merge": _ev_hyp_merge,
     "fix_begin": _ev_fix_begin,
     "classify": _ev_classify,
+    "directive_clear": _ev_directive_clear,
     "resolve_block": _ev_resolve_block,
     "fork_open": _ev_fork_open,
     "dispute": _ev_dispute,
@@ -388,9 +399,15 @@ class Ledger:
             )
 
     def _clear_directive(self, action):
+        """Satisfied directives are cleared by event, not by mutating memory.
+
+        The CLI runs one command per process, so an in-memory clear would be discarded
+        when the process exits and the directive would reappear on replay — leaving the
+        run permanently wedged on a directive it had already discharged.
+        """
         directive = self.state["directive"]
         if directive and action in DIRECTIVE_REQUIRES[directive["kind"]]:
-            self.state["directive"] = None
+            self._append("control", {"ev": "directive_clear", "kind": directive["kind"]})
 
     def _require_ran_red_loop(self, incident):
         loop = self.state["loops"].get(incident)
@@ -437,21 +454,20 @@ class Ledger:
     # -- entry A: the feedback loop ----------------------------------------- #
 
     def declare_loop(self, incident, command, symptom):
-        incident = req(incident, "--incident")
-        ledger = self
-        ledger._enforce_directive("loop_declare")
-        ledger._append(
+        self._enforce_directive("declare_loop")
+        self._append(
             "control",
             {
                 "ev": "loop_declare",
-                "incident": incident,
+                "incident": req(incident, "--incident"),
                 "command": req(command, "--command"),
                 "symptom": req(symptom, "--symptom"),
             },
         )
-        return ledger
+        return self
 
     def run_loop(self, incident, red):
+        self._enforce_directive("run_loop")
         incident = req(incident, "--incident")
         if red not in (True, False):
             raise UsageError("--red must be true or false; state the observed result")
@@ -520,7 +536,10 @@ class Ledger:
 
     def begin_fix(self, incident, note):
         self._enforce_directive("begin_fix")
-        incident = req(incident, "--incident")
+        tested = [h for h in self.state["hypotheses"].values() if h["incident"] == incident]
+        if not tested:
+            # Report the first missing step, not the arithmetic at the end of the ladder.
+            self._require_ran_red_loop(incident)
         unsettled = self._unsettled_incidents()
         if incident in unsettled:
             open_ids = sorted(
@@ -816,6 +835,11 @@ class Ledger:
         failures = []
         if open_hyps:
             failures.append(f"hypotheses still untested: {open_hyps}")
+        if s["directive"] and s["directive"]["kind"] == "loop_defective":
+            failures.append(
+                "a feedback loop was declared defective and never rebuilt; evidence gathered "
+                "through it does not count. Rebuild the loop (Entry A1) first."
+            )
         if uncovered and not blocks:
             failures.append(f"acceptance criteria never checked: {uncovered}")
         if failures:
@@ -1012,7 +1036,7 @@ def _build_parser():
 
     node = add("init", "create a ledger")
     node.add_argument("--intent", required=True)
-    node.add_argument("--criterion", action="append", default=[])
+    node.add_argument("--criterion", action="extend", nargs="+", default=[])
 
     node = add("declare-loop", "declare the feedback loop for an incident")
     node.add_argument("--incident", required=True)
@@ -1063,7 +1087,7 @@ def _build_parser():
     node.add_argument("--question", required=True)
     node.add_argument("--trigger", required=True)
     node.add_argument("--assumed", required=True)
-    node.add_argument("--option", action="append", default=[])
+    node.add_argument("--option", action="extend", nargs="+", default=[])
     node.add_argument("--invalidation-rationale")
 
     node = add("dispute", "record an adversarial pass against the favoured option")
@@ -1079,8 +1103,8 @@ def _build_parser():
     node.add_argument("--by", required=True, choices=("agent", "human"))
     node.add_argument("--human-ack", action="store_true")
     node.add_argument("--reversibility", choices=REVERSIBILITIES)
-    node.add_argument("--anchor", action="append", default=[])
-    node.add_argument("--invalidated", action="append", default=[])
+    node.add_argument("--anchor", action="extend", nargs="+", default=[])
+    node.add_argument("--invalidated", action="extend", nargs="+", default=[])
     node.add_argument("--rationale")
 
     node = add("record-evidence", "record a verification result")

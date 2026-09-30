@@ -157,8 +157,40 @@ def test_merging_a_claim_into_itself_is_refused(led):
     armed(led)
     led.open_hypothesis("H1", INCIDENT, "newline mode", "mode would be 'r'")
     led.open_hypothesis("H2", INCIDENT, "encoding cookie missing", "adding a cookie fixes it")
-    with pytest.raises(Blocked, match="no-op"):
+    with pytest.raises(Blocked, match="into itself"):
         led.merge_hypotheses("H1", "H1", "same thing")
+
+
+def test_a_refuted_hypothesis_can_be_folded_into_the_survivor(led):
+    two_refuted(led)
+    led.open_hypothesis("H3", INCIDENT, "the parser drops the BOM", "stripping the BOM fixes it")
+    led.merge_hypotheses("H3", "H1", "same newline-stripping mechanism as H1")
+    assert led.state["hypotheses"]["H1"]["status"] == "merged"
+    assert led.state["hypotheses"]["H3"]["merged_from"] == ["H1"]
+
+
+def test_merging_never_lowers_the_number_of_explanations_tested(led):
+    armed(led)
+    led.open_hypothesis("H1", INCIDENT, "newline mode", "mode would be 'r'")
+    led.open_hypothesis("H2", INCIDENT, "encoding cookie missing", "adding a cookie fixes it")
+    led.close_hypothesis("H1", "probe", "still red", survives=False)
+    led.close_hypothesis("H2", "probe", "green", survives=True)
+    led.merge_hypotheses("H2", "H1", "same newline mechanism")
+    with pytest.raises(Blocked, match="only 2 hypothesis"):
+        led.begin_fix(INCIDENT, "strip the BOM")
+
+
+def test_an_already_merged_hypothesis_cannot_be_merged_again(led):
+    two_refuted(led)
+    led.open_hypothesis("H3", INCIDENT, "BOM handling", "stripping it fixes it")
+    led.merge_hypotheses("H3", "H1", "same mechanism")
+    with pytest.raises(Blocked, match="already merged into"):
+        led.merge_hypotheses("H2", "H1", "again")
+
+
+def test_begin_fix_names_the_missing_loop_rather_than_the_count(led):
+    with pytest.raises(Blocked, match="no declared feedback loop"):
+        led.begin_fix(INCIDENT, "guess a fix")
 
 
 def test_supplying_the_missing_fact_clears_the_block(led):
@@ -567,3 +599,71 @@ def test_main_is_importable_for_in_process_gating(tmp_path):
     assert main(["init", str(path), "--intent", "x"]) == 0
     assert main(["open-hypothesis", str(path), "--id", "H1", "--incident", "I",
                  "--claim", "c", "--prediction", "p"]) == 3
+
+
+# --------------------------------------------------------------------------- #
+# regressions found by driving the CLI, where each command is its own process
+# --------------------------------------------------------------------------- #
+
+
+def test_a_discharged_directive_stays_cleared_across_processes(tmp_path):
+    path = tmp_path / "L"
+    assert main(["init", str(path), "--intent", "x"]) == 0
+    assert main(["classify", str(path), "--signature", "flake", "--kind", "loop_defective"]) == 0
+    assert main(["open-hypothesis", str(path), "--id", "H1", "--incident", "I",
+                 "--claim", "shared tmpdir", "--prediction", "a per-run dir removes it"]) == 3
+    assert main(["declare-loop", str(path), "--incident", "I",
+                 "--command", "pytest -k flake", "--symptom", "fails only on CI"]) == 0
+    assert main(["run-loop", str(path), "--incident", "I", "--red", "true"]) == 0
+    assert main(["open-hypothesis", str(path), "--id", "H1", "--incident", "I",
+                 "--claim", "shared tmpdir", "--prediction", "a per-run dir removes it"]) == 0
+    # The directive was discharged by the previous process; a new one must not see it.
+    assert Ledger(path).state["directive"] is None
+    assert main(["refute-hypothesis", str(path), "--id", "H1",
+                 "--probe", "per-run TMPDIR", "--observed", "20/20 green"]) == 0
+    assert Ledger(path).state["directive"] is None
+
+
+def test_multi_valued_flags_accept_several_entries_after_one_flag(tmp_path):
+    path = tmp_path / "L"
+    assert main(["init", str(path), "--intent", "x", "--criterion", "one", "two"]) == 0
+    assert Ledger(path).state["criteria"] == ["one", "two"]
+    assert main(["open-fork", str(path), "--id", "F1", "--question", "q", "--trigger", "t",
+                 "--assumed", "redis",
+                 "--option", '{"id":"sqs","cost":"1d","risk":"low","reversibility":"reversible"}',
+                 '{"id":"nats","cost":"3d","risk":"med","reversibility":"reversible"}']) == 0
+    assert main(["dispute", str(path), "--fork", "F1", "--challenger", "rev",
+                 "--author", "main", "--steelman", "nats is better"]) == 0
+    assert main(["decide", str(path), "--fork", "F1", "--chosen", "sqs", "--by", "agent",
+                 "--invalidated", "US-004", "AC-1", "runbook 3",
+                 "--anchor", "security", "privacy"]) == 3
+    assert main(["decide", str(path), "--fork", "F1", "--chosen", "sqs", "--by", "human",
+                 "--human-ack", "--anchor", "security", "privacy",
+                 "--invalidated", "US-004", "AC-1", "runbook 3"]) == 0
+    decision = Ledger(path).state["decisions"]["F1"]
+    assert decision["invalidated"] == ["US-004", "AC-1", "runbook 3"]
+    assert decision["anchors"] == ["security", "privacy"]
+
+
+def test_evidence_from_a_loop_you_declared_defective_does_not_close(led):
+    settled(led)
+    verified(led)
+    led.classify("test-suite-red", "loop_defective")
+    status, reasons = led.outcome()
+    assert status == "FAILED VERIFICATION"
+    assert any("declared defective" in r for r in reasons)
+
+
+def test_rebuilding_the_loop_lets_the_run_close(led):
+    settled(led)
+    verified(led)
+    led.classify("test-suite-red", "loop_defective")
+    assert led.outcome()[0] == "FAILED VERIFICATION"
+    led.declare_loop(INCIDENT, "pytest -k crlf --maxfail=1 -x", "the same failure, isolated")
+    led.run_loop(INCIDENT, red=True)
+    led.open_hypothesis("H4", INCIDENT, "the fixture order hides the second failure",
+                        "isolating one test at a time reproduces it")
+    led.close_hypothesis("H4", "per-test isolation probe", "reproduced: the 4th fixture alone", survives=True)
+    status, reasons = led.outcome()
+    assert status in ("COMPLETE", "COMPLETE WITH RISKS")
+    assert not any("defective" in r for r in reasons)
