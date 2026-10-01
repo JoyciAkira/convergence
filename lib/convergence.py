@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-LEDGER_VERSION = 1
+LEDGER_VERSION = 2
 
 OK = 0
 USAGE = 2
@@ -125,7 +125,18 @@ LOGS = {
     "evidence": "evidence.jsonl",
 }
 
-FINAL_STATUSES = ("FAILED VERIFICATION", "BLOCKED", "COMPLETE WITH RISKS", "COMPLETE")
+#: The magnet has two poles and one question: was the outcome reached? Everything else is
+#: a reason it was not, not a lesser kind of success. A run that ends any other way is
+#: still going, and `next-action` says what it is waiting on.
+FINAL_STATUSES = ("REACHED", "NOT REACHED")
+
+#: A block must be earned: this many distinct routes must have been tried and recorded
+#: before a missing fact counts as unobtainable rather than merely unlooked-for. Without
+#: it, "never stop" becomes "never try", and the block is a give-up button.
+MIN_BLOCK_ROUTES = 2
+
+#: The right edge is the criteria list. It is set once and moves only through a disputed,
+#: recorded fork — never by editing, and never silently.
 
 
 class Blocked(Exception):
@@ -183,6 +194,7 @@ def empty_state():
         "resolved_blocks": [],
         "risks": [],
         "directive": None,
+        "criterion_revisions": [],
         "events": 0,
     }
 
@@ -291,6 +303,8 @@ def _ev_classify(s, ev):
             "kind": ev["kind"],
             "missing_fact": ev.get("missing_fact"),
             "smallest_input": ev.get("smallest_input"),
+            "tried": ev.get("tried") or [],
+            "park": ev.get("park"),
             "note": ev.get("note"),
             "at": ev["at"],
         }
@@ -319,8 +333,25 @@ def _ev_fork_open(s, ev):
         "assumed": ev["assumed"],
         "options": ev["options"],
         "invalidation_rationale": ev.get("invalidation_rationale"),
+        "criterion_from": ev.get("criterion_from"),
+        "criterion_to": ev.get("criterion_to"),
         "opened_at": ev["at"],
     }
+
+
+def _ev_criterion_revised(s, ev):
+    """Move the right edge. Only ever reached through a disputed, decided fork."""
+    s["criteria"] = [c for c in s["criteria"] if c != ev["from"]]
+    s["criteria"].append(ev["to"])
+    s["criterion_revisions"].append(
+        {
+            "from": ev["from"],
+            "to": ev["to"],
+            "fork": ev["fork"],
+            "invalidated": ev.get("invalidated") or [],
+            "at": ev["at"],
+        }
+    )
 
 
 def _ev_dispute(s, ev):
@@ -383,6 +414,7 @@ _HANDLERS = {
     "directive_clear": _ev_directive_clear,
     "resolve_block": _ev_resolve_block,
     "fork_open": _ev_fork_open,
+    "criterion_revised": _ev_criterion_revised,
     "dispute": _ev_dispute,
     "decide": _ev_decide,
     "evidence": _ev_evidence,
@@ -632,13 +664,25 @@ class Ledger:
 
     # -- entry C: non-convergence ------------------------------------------ #
 
-    def classify(self, signature, kind, missing_fact=None, smallest_input=None, note=None):
+    def classify(
+        self, signature, kind, missing_fact=None, smallest_input=None,
+        tried=(), park=None, note=None,
+    ):
         self._enforce_directive("classify")
         kind = one_of(kind, tuple(DIRECTIVE_REQUIRES), "--kind")
         signature = req(signature, "--signature")
+        tried = [str(t).strip() for t in (tried or []) if str(t).strip()]
         if kind == "information_missing":
             req(missing_fact, "--missing-fact")
             req(smallest_input, "--smallest-input")
+            distinct = {t.lower() for t in tried}
+            if len(distinct) < MIN_BLOCK_ROUTES:
+                raise Blocked(
+                    f"a block parks one path; it does not end the run. But it must be "
+                    f"earned: record at least {MIN_BLOCK_ROUTES} distinct routes you "
+                    f"already took to obtain {missing_fact!r} with --tried. A fact you "
+                    f"merely stopped looking for is not an unavailable fact."
+                )
         self._append(
             "control",
             {
@@ -647,6 +691,8 @@ class Ledger:
                 "kind": kind,
                 "missing_fact": missing_fact,
                 "smallest_input": smallest_input,
+                "tried": tried,
+                "park": park,
                 "note": note,
             },
         )
@@ -665,7 +711,25 @@ class Ledger:
 
     # -- entry B: forks and disputes ---------------------------------------- #
 
-    def open_fork(self, ident, question, trigger, assumed, options, invalidation_rationale=None):
+    def open_fork(
+        self, ident, question, trigger, assumed, options,
+        invalidation_rationale=None, criterion_from=None, criterion_to=None,
+    ):
+        if criterion_from is not None or criterion_to is not None:
+            criterion_from = req(criterion_from, "--criterion-from")
+            criterion_to = req(criterion_to, "--criterion-to")
+            if criterion_from not in self.state["criteria"]:
+                raise UsageError(
+                    f"--criterion-from {criterion_from!r} is not a criterion of this run. "
+                    f"The right edge is fixed at init; it moves only by naming an edge that "
+                    f"exists. Current: {self.state['criteria']}"
+                )
+            if criterion_to in self.state["criteria"]:
+                raise Blocked(
+                    f"--criterion-to {criterion_to!r} is already a criterion. Moving the "
+                    f"right edge onto an edge the run already holds would merge two "
+                    f"promises into one and quietly drop the other."
+                )
         options = list(options or [])
         if not options:
             raise UsageError("a fork needs at least one option (a dict per option)")
@@ -700,6 +764,8 @@ class Ledger:
                 "trigger": req(trigger, "--trigger"),
                 "assumed": req(assumed, "--assumed"),
                 "options": options,
+                "criterion_from": criterion_from,
+                "criterion_to": criterion_to,
                 "invalidation_rationale": invalidation_rationale,
             },
         )
@@ -811,6 +877,23 @@ class Ledger:
                 "override_reason": override_reason,
             },
         )
+        if record.get("criterion_to") is not None:
+            if chosen not in ("revise", "keep"):
+                raise UsageError(
+                    f"fork {fork!r} moves the right edge, so it must be decided as "
+                    f"'revise' or 'keep', not {chosen!r}"
+                )
+            if chosen == "revise":
+                self._append(
+                    "control",
+                    {
+                        "ev": "criterion_revised",
+                        "from": record["criterion_from"],
+                        "to": record["criterion_to"],
+                        "fork": fork,
+                        "invalidated": [str(i) for i in invalidated if str(i).strip()],
+                    },
+                )
         return self
 
     # -- evidence ----------------------------------------------------------- #
@@ -873,93 +956,100 @@ class Ledger:
     # -- derivation --------------------------------------------------------- #
 
     def outcome(self):
-        """Final status, computed by precedence. Never inferred from a flag.
+        """REACHED or NOT REACHED — the magnet has two poles and one question.
 
-        Precedence is FAILED VERIFICATION > BLOCKED > COMPLETE WITH RISKS > COMPLETE.
-        A criterion carrying no evidence is a FAILURE only when nothing prevented it
-        from being checked. While a block is outstanding the same criterion is a
-        consequence of the block, and reporting it as a failed verification would blame
-        the work for a missing credential or an undecided fork.
+        `blocking` is everything standing between the run and the outcome. Any of it
+        present means NOT REACHED. There is no lesser kind of success: a criterion that
+        could not be verified is unmet intent, not decoration, so it blocks.
+
+        `disclosed` is how the result was reached, recorded but not gating: dissent
+        overruled, a narrow search, an autonomously authored decision, a run that had to
+        be restarted from a non-convergence diagnosis. Those are method notes about a
+        result that *was* reached. Gating on them made a clean verdict unreachable for
+        any run that met a fork, which is backwards.
         """
         s = self.state
         open_hyps = sorted(h["id"] for h in s["hypotheses"].values() if h["status"] == "open")
         undecided = sorted(f for f in s["forks"] if f not in s["decisions"])
-        blocked_sigs = [
+        resolved = self._resolved_signatures()
+        parked = [
             c for c in s["classifications"]
-            if c["kind"] == "information_missing"
-            and c["signature"] not in self._resolved_signatures()
+            if c["kind"] == "information_missing" and c["signature"] not in resolved
         ]
-        blocking_risks = [r for r in s["risks"] if r["blocking"]]
+        blocking_risks = [r["text"] for r in s["risks"] if r["blocking"]]
         covered = {e["criterion"] for e in s["evidence"] if e["tier"] != "unavailable"}
-        unavailable_only = {
+        unavailable_only = sorted(
             c for c in s["criteria"]
             if c not in covered and any(e["criterion"] == c for e in s["evidence"])
-        }
-        uncovered = [c for c in s["criteria"] if c not in covered and c not in unavailable_only]
-        overruled = sorted(
-            f for f, d in s["decisions"].items() if d.get("challenger_overruled")
         )
-        nonterminal = [c for c in s["classifications"] if c["kind"] != "information_missing"]
+        uncovered = [
+            c for c in s["criteria"]
+            if c not in covered and c not in unavailable_only
+        ]
 
-        blocks = []
+        blocking = []
+        if uncovered:
+            blocking.append(f"criteria never verified: {uncovered}")
+        if unavailable_only:
+            blocking.append(
+                f"criteria that could only be verified as unavailable: {unavailable_only}"
+            )
+        if open_hyps:
+            blocking.append(f"hypotheses still untested: {open_hyps}")
         if undecided:
-            blocks.append(f"forks never decided: {undecided}")
-        if blocked_sigs:
-            blocks.append(
-                "missing facts never supplied: "
+            blocking.append(f"forks never decided: {undecided}")
+        if parked:
+            blocking.append(
+                "paths parked on facts nobody supplied: "
                 + ", ".join(
-                    f"{c['signature']} (needs {c['missing_fact']} via {c['smallest_input']})"
-                    for c in blocked_sigs
+                    f"{c['signature']}"
+                    + (f" (parked: {c['park']})" if c.get("park") else "")
+                    + f" needs {c['missing_fact']} via {c['smallest_input']}"
+                    for c in parked
                 )
             )
-        if blocking_risks:
-            blocks.append(f"blocking risks recorded: {[r['text'] for r in blocking_risks]}")
-
-        failures = []
-        if open_hyps:
-            failures.append(f"hypotheses still untested: {open_hyps}")
         if s["directive"] and s["directive"]["kind"] == "loop_defective":
-            failures.append(
+            blocking.append(
                 "a feedback loop was declared defective and never rebuilt; evidence gathered "
-                "through it does not count. Rebuild the loop (Entry A1) first."
+                "through it does not count"
             )
-        if uncovered and not blocks:
-            failures.append(f"acceptance criteria never checked: {uncovered}")
-        if failures:
-            return "FAILED VERIFICATION", failures
+        if blocking_risks:
+            blocking.append(f"blocking risks recorded: {blocking_risks}")
 
-        if blocks:
-            if uncovered:
-                blocks.append(f"acceptance criteria left unverified by the block: {uncovered}")
-            return "BLOCKED", blocks
-
-        risks = []
-        if unavailable_only:
-            risks.append(f"criteria verified only as unavailable: {sorted(unavailable_only)}")
+        disclosed = []
+        if s["criterion_revisions"]:
+            disclosed.append(
+                f"the right edge was moved {len(s['criterion_revisions'])} time(s), each "
+                f"through a disputed fork: "
+                + ", ".join(f"{r['from']!r} -> {r['to']!r}" for r in s["criterion_revisions"])
+            )
+        overruled = sorted(f for f, d in s["decisions"].items() if d.get("challenger_overruled"))
         if overruled:
-            risks.append(
+            disclosed.append(
                 f"the challenger's objection was overruled on {overruled}: "
                 f"{[s['decisions'][f].get('override_reason') for f in overruled]}"
             )
-        if nonterminal:
-            risks.append(
-                "repeated non-convergence kept this run alive past its own diagnosis: "
-                + ", ".join(sorted({c["signature"] for c in nonterminal}))
-            )
         narrow = sorted(k for k, v in s["fixes"].items() if v.get("search") == "narrow")
         if narrow:
-            risks.append(
-                "fixes chosen with --search narrow, i.e. without searching over rival "
+            disclosed.append(
+                f"fixes chosen with --search narrow, i.e. without searching over rival "
                 f"explanations: {narrow}"
             )
-        risks.extend(f"risk: {r['text']}" for r in s["risks"] if not r["blocking"])
-        if risks:
-            return "COMPLETE WITH RISKS", risks
-        return "COMPLETE", []
+        nonterminal = sorted({
+            c["signature"] for c in s["classifications"] if c["kind"] != "information_missing"
+        })
+        if nonterminal:
+            disclosed.append(
+                "repeated non-convergence kept this run alive past its own diagnosis: "
+                + ", ".join(nonterminal)
+            )
+        disclosed.extend(f"risk: {r['text']}" for r in s["risks"] if not r["blocking"])
+
+        return ("NOT REACHED" if blocking else "REACHED"), blocking, disclosed
 
     def report(self):
         s = self.state
-        status, reasons = self.outcome()
+        status, blocking, disclosed = self.outcome()
         covered = {e["criterion"] for e in s["evidence"] if e["tier"] != "unavailable"}
         unavailable = {
             e["criterion"] for e in s["evidence"] if e["tier"] == "unavailable"
@@ -1051,44 +1141,80 @@ class Ledger:
         lines += anchored or ["None touched"]
         lines.append("")
 
-        lines += ["## Residual uncertainty", ""]
-        lines += rows([f"- {r}" for r in reasons])
+        lines += ["## What still stands between the run and the outcome", ""]
+        lines += rows([f"- {r}" for r in blocking])
+        lines.append("")
+
+        lines += ["## How the outcome was reached", ""]
+        lines += rows([f"- {r}" for r in disclosed])
         lines.append("")
 
         lines += ["## Final status", "", f"**{status}**", ""]
         return "\n".join(lines)
 
     def next_action(self):
+        """The next thing the run owes. A parked path never becomes a stopping point
+        while other work remains — that is the whole difference between a block and an
+        ending. Parked paths are reported alongside, not instead."""
         s = self.state
+        resolved = self._resolved_signatures()
+        parked = [
+            f"{c['signature']}"
+            + (f" (parked: {c['park']})" if c.get("park") else "")
+            + f" needs {c['missing_fact']} via {c['smallest_input']}"
+            for c in s["classifications"]
+            if c["kind"] == "information_missing" and c["signature"] not in resolved
+        ]
+
+        def answer(required, because):
+            out = {"required": required, "because": because}
+            if parked:
+                out["parked_paths"] = parked
+                out["parked_note"] = (
+                    "these paths are parked, not finished; other work continues meanwhile"
+                )
+            return out
+
         if s["directive"]:
             allowed = DIRECTIVE_REQUIRES[s["directive"]["kind"]]
-            return {
-                "required": allowed[0] if allowed else "resolve_block",
-                "because": DIRECTIVE_MESSAGE[s["directive"]["kind"]],
-            }
-        for fork_id, fork in sorted(s["forks"].items()):
-            if fork_id not in s["decisions"]:
-                if not any(d["fork"] == fork_id for d in s["disputes"]):
-                    return {
-                        "required": "dispute",
-                        "because": f"fork {fork_id!r} is open and undisputed",
-                    }
-                return {"required": "decide", "because": f"fork {fork_id!r} is disputed but undecided"}
-        for item in s["classifications"]:
-            if item["kind"] == "information_missing" and item["signature"] not in self._resolved_signatures():
-                return {
-                    "required": "resolve_block",
-                    "because": f"blocked on {item['missing_fact']}",
-                }
+            return answer(
+                allowed[0] if allowed else "resolve_block",
+                DIRECTIVE_MESSAGE[s["directive"]["kind"]],
+            )
+
         unsettled = sorted(
             {h["incident"] for h in s["hypotheses"].values() if h["status"] == "open"}
         )
         if unsettled:
-            return {
-                "required": "hyp_refute",
-                "because": f"open hypotheses on incident(s) {unsettled}",
-            }
-        return {"required": "close", "because": "no outstanding gate"}
+            return answer(
+                "hyp_refute",
+                f"open hypotheses on incident(s) {unsettled}",
+            )
+
+        for fork_id in sorted(s["forks"]):
+            if fork_id not in s["decisions"]:
+                if not any(d["fork"] == fork_id for d in s["disputes"]):
+                    return answer("dispute", f"fork {fork_id!r} is open and undisputed")
+                return answer("decide", f"fork {fork_id!r} is disputed but undecided")
+
+        covered = {e["criterion"] for e in s["evidence"] if e["tier"] != "unavailable"}
+        short = [c for c in s["criteria"] if c not in covered]
+        if short:
+            return answer(
+                "record-evidence",
+                f"criteria with no executed evidence yet: {short}",
+            )
+
+        if parked:
+            return answer(
+                "resolve_block",
+                "everything else is verified; only the parked paths remain: " + "; ".join(parked),
+            )
+
+        blocking, _ = self.outcome()[1:]
+        if blocking:
+            return answer("record-risk", f"outstanding: {blocking}")
+        return answer("close", "the outcome is reached")
 
 
 # --------------------------------------------------------------------------- #
@@ -1170,6 +1296,11 @@ def _build_parser():
     )
     node.add_argument("--missing-fact")
     node.add_argument("--smallest-input")
+    node.add_argument("--tried", action="extend", nargs="+", default=[],
+                      help="distinct routes already attempted; a block must be earned")
+    node.add_argument("--park",
+                      help="the path this block parks (a fork id, incident id, or tag). "
+                           "The run continues elsewhere.")
     node.add_argument("--note")
 
     node = add("resolve-block", "clear a missing-fact block once the input arrives")
@@ -1183,6 +1314,9 @@ def _build_parser():
     node.add_argument("--assumed", required=True)
     node.add_argument("--option", action="extend", nargs="+", default=[])
     node.add_argument("--invalidation-rationale")
+    node.add_argument("--criterion-from",
+                      help="move the right edge: the criterion being revised")
+    node.add_argument("--criterion-to", help="move the right edge: its replacement")
 
     node = add("dispute", "record an adversarial pass against the favoured option")
     node.add_argument("--fork", required=True)
@@ -1263,7 +1397,8 @@ def _dispatch(args):
         ledger.begin_fix(args.incident, args.note, search=args.search)
     elif command == "classify":
         ledger.classify(
-            args.signature, args.kind, args.missing_fact, args.smallest_input, args.note
+            args.signature, args.kind, args.missing_fact, args.smallest_input,
+            tried=args.tried, park=args.park, note=args.note,
         )
     elif command == "resolve-block":
         ledger.resolve_block(args.signature, args.provided)
@@ -1275,6 +1410,8 @@ def _dispatch(args):
             args.assumed,
             _options(args.option),
             args.invalidation_rationale,
+            criterion_from=args.criterion_from,
+            criterion_to=args.criterion_to,
         )
     elif command == "dispute":
         ledger.dispute(args.fork, args.challenger, args.author, args.steelman, args.verdict)
@@ -1314,8 +1451,8 @@ def _dispatch(args):
         report = ledger.report()
         (ledger.root / "report.md").write_text(report, encoding="utf-8")
         print(report)
-        status, _ = ledger.outcome()
-        return OK if status in ("COMPLETE", "COMPLETE WITH RISKS") else BLOCKED
+        status = ledger.outcome()[0]
+        return OK if status == "REACHED" else BLOCKED
     else:  # pragma: no cover - argparse already constrains this
         raise UsageError(f"unknown command {command!r}")
 

@@ -10,6 +10,21 @@ you are allowed to have done it.** If the two disagree, the machine wins — it 
 and prints the gate that refused you. Do not look for a way around it, because there is
 none, and that is the point.
 
+## The magnet
+
+The skill holds the run between two edges.
+
+- **Left — the request.** One intent and its acceptance criteria, fixed at `init`. No
+  command edits them. They move only through a disputed, recorded fork, and a moved edge
+  starts unverified.
+- **Right — the result.** Not negotiable, never traded, never reported as partly reached.
+  There are exactly two answers: `REACHED` or `NOT REACHED`.
+- **The middle.** Every hypothesis, fork, obstacle and retry. Governed by the machine,
+  never terminal. A block parks one path and the run continues.
+
+An obstacle is never an outcome. "No limitazioni" means the limit belongs where the
+information is missing, not where persistence ran out.
+
 The machine is `lib/convergence.py`. Every command below is a real subcommand of it.
 
 ```bash
@@ -62,6 +77,32 @@ needs to rebut it.
 
 Criteria are the unit of verification. Each one must be closeable by a command someone
 else could re-run. If you cannot name the command, the criterion is not a criterion yet.
+
+### The right edge does not move quietly
+
+`--intent` and the criteria are the two poles of the magnet. They are set once, at `init`,
+and **no command edits them**. That is deliberate: without it, "done" is something an
+agent can reach by rewriting the goal.
+
+When reality makes a criterion unreachable or wrong, you do not edit it. You open a fork
+that carries the move, and it goes through the same dispute as any other decision:
+
+```bash
+$CONVERGENCE open-fork "$LEDGER" --id FR \
+  --question "this criterion turned out to be unreachable as written" \
+  --trigger "the fourth fixture carries a BOM and was never in the original report" \
+  --assumed keep \
+  --criterion-from "handles CRLF" \
+  --criterion-to "handles CRLF and BOM-prefixed fixtures" \
+  --option '{"id":"keep","cost":"0d","risk":"low","reversibility":"reversible"}' \
+          '{"id":"revise","cost":"1d","risk":"med","reversibility":"reversible"}'
+```
+
+Then `dispute`, then `decide --chosen revise --invalidated "AC-1 the CRLF test"`. The
+revision applies only once the dispute is settled and the invalidation is named — and the
+new criterion **starts unverified**, so the run is immediately `NOT REACHED` until you earn
+it again. Widening the edge is allowed; widening it silently, or keeping the old green
+while the new edge is unproven, is not.
 
 ---
 
@@ -267,19 +308,28 @@ where persistence ran out.
 (`OOM at 3.2 GB on the transform step`), not an error string (`exit code 1`). Classifying
 `exit code 1` is how a run dies for the wrong reason.
 
-## The one legitimate stop
+## Parking one path — never stopping the run
+
+A block is not an ending. It parks **one path**, names the fact that would release it, and
+the run keeps going everywhere else. The block has to be earned: the machine refuses one
+that does not name the routes you already took.
 
 ```bash
 $CONVERGENCE classify "$LEDGER" --signature "needs-vault-token" --kind information_missing \
   --missing-fact "a Vault token with read access to the secrets path" \
-  --smallest-input "the operator running `vault login`, or a token pasted into the session"
+  --smallest-input "the operator running `vault login`, or a token pasted into the session" \
+  --tried "checked the environment, no VAULT_TOKEN" "asked the secrets endpoint, 403" \
+  --park "F-deploy"
 ```
 
-Both fields are mandatory, because a block that cannot name its own remedy is just a
-complaint. This is the only condition under which `close` may return `BLOCKED`, and it
-returns `BLOCKED` naming exactly what is needed.
+`--tried` needs at least two **distinct** routes. Repeating one route does not count, and
+that is the whole guard: "never stop" must not quietly become "never try", or the block
+becomes a give-up button with extra steps.
 
-When the input arrives, record what unblocked you — the disclosure outlives the block:
+`--park` names the path being parked — a fork id, an incident id, any tag. It shows up in
+`next-action` under `parked_paths` alongside the real next move, never instead of it.
+
+When the input arrives, record what released you; the disclosure outlives the block:
 
 ```bash
 $CONVERGENCE resolve-block "$LEDGER" --signature "needs-vault-token" \
@@ -287,9 +337,9 @@ $CONVERGENCE resolve-block "$LEDGER" --signature "needs-vault-token" \
 ```
 
 An environment or dependency that will not come up is **not** a stop. A package registry
-that is unreachable is `information_missing` with a named fact. A toolchain that will not
-build after three genuine attempts is `loop_defective` — the loop is bad, so rebuild the
-loop. Only a fact you cannot obtain ends the run.
+that is unreachable is a parked path with a named fact. A toolchain that will not build
+after three genuine attempts is `loop_defective` — the loop is bad, so rebuild the loop.
+Nothing but an unobtainable fact parks anything, and a park is not a wall.
 
 ---
 
@@ -333,24 +383,30 @@ opinion is not a tier. Name the command.
 # Close
 
 ```bash
-$CONVERGENCE close "$LEDGER"     # writes report.md, prints it, exits 0 or 3
+$CONVERGENCE close "$LEDGER"     # writes report.md, prints it, exits 0 only on REACHED
 ```
 
-The status is **derived**, never asserted, and follows a fixed precedence:
+The magnet has two poles and one question: **was the outcome reached?** There is no third
+answer.
 
-1. **`FAILED VERIFICATION`** — a hypothesis is still untested; a criterion was never
-   checked while nothing was blocking it; or a feedback loop you declared defective was
-   never rebuilt, in which case evidence gathered through it does not count.
-2. **`BLOCKED`** — a fork is undecided, a named fact is missing, or a blocking risk stands.
-3. **`COMPLETE WITH RISKS`** — everything required passed, but something was verified only
-   as unavailable, or a fork was decided by an agent rather than a human, or the run had to
-   be restarted from a non-convergence diagnosis.
-4. **`COMPLETE`** — every criterion covered by executed evidence, no open hypothesis, no
-   undecided fork, no disclosed risk.
+- **`REACHED`** — every criterion verified by executed, independently-checkable evidence;
+  no untested hypothesis; no undecided fork; no parked path; no unrebuilt defective loop;
+  no blocking risk.
+- **`NOT REACHED`** — anything of the above stands. The run is *still going*, not finished.
+  `next-action` tells you precisely what it is waiting on.
 
-You may not announce a status the machine did not print. A criterion left unverified
-*because* of a block reports as `BLOCKED`, not as a failed verification — the work did not
-fail, the information was absent. Do not "fix" that by reporting it any other way.
+`close` exits `0` **only** on `REACHED`. There is no lesser kind of success: a criterion
+you could not verify is unmet intent, not decoration, and it blocks.
+
+Separately, the report carries **disclosures** that do not gate — how the result was
+reached rather than whether it was: dissent overruled, a `--search narrow` fix, an
+autonomously authored decision, a run that had to be restarted from a non-convergence
+diagnosis. Those are method notes about a result you did reach. Gating on them made a clean
+verdict unreachable for any run that met a fork, which is backwards; an agent can and
+should be able to reach `REACHED`.
+
+You may not announce a status the machine did not print, and you may not describe a
+`NOT REACHED` run as finished because the parts you did finish are green.
 
 ---
 
@@ -381,6 +437,11 @@ Read this as a list of arguments you cannot win. Each is a test.
 - `unavailable` without a reason
 - a ledger that was already initialised
 - a close while a `loop_defective` directive is still outstanding
+- an `information_missing` that does not name the fact, the smallest input, and at least
+  two distinct routes already tried
+- a criterion revision naming an edge that does not exist
+- a criterion revision decided without a dispute, or without naming what it invalidates
+- an edge moved to something already on the list
 
 ## Anti-patterns
 

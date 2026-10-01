@@ -131,9 +131,9 @@ def test_a_narrow_search_is_permitted_but_priced(led):
     led.begin_fix(INCIDENT, "add the null guard", search="narrow")
     assert led.state["fixes"][INCIDENT]["search"] == "narrow"
     verified(led)
-    status, reasons = led.outcome()
-    assert status == "COMPLETE WITH RISKS"
-    assert any("without searching over rival" in r for r in reasons)
+    status, blocking, disclosed = led.outcome()
+    assert status == "REACHED", blocking
+    assert any("without searching over rival" in d for d in disclosed)
 
 
 def test_the_search_width_is_recorded_and_shown_in_the_report(led):
@@ -237,37 +237,65 @@ def test_begin_fix_names_the_missing_loop_rather_than_the_count(led):
         led.begin_fix(INCIDENT, "guess a fix")
 
 
-def test_supplying_the_missing_fact_clears_the_block(led):
+def earned_block(led, signature="needs-vault-token", park=None):
     led.classify(
-        "needs-vault-token",
+        signature,
         "information_missing",
-        missing_fact="a Vault token",
-        smallest_input="vault login",
+        missing_fact="a Vault token with read access",
+        smallest_input="the operator running `vault login`",
+        tried=["checked the env, no VAULT_TOKEN", "asked the secrets endpoint, 403"],
+        park=park,
     )
-    assert led.outcome()[0] == "BLOCKED"
+    return led
+
+
+def test_a_block_must_be_earned_by_recording_routes_already_taken(led):
+    with pytest.raises(Blocked, match="must be\n?\\s*earned|a block parks one path"):
+        led.classify("needs-vault-token", "information_missing",
+                     missing_fact="a Vault token", smallest_input="vault login")
+    with pytest.raises(Blocked, match="distinct routes"):
+        led.classify("needs-vault-token", "information_missing",
+                     missing_fact="a Vault token", smallest_input="vault login",
+                     tried=["looked once"])
+    with pytest.raises(Blocked, match="distinct routes"):
+        led.classify("needs-vault-token", "information_missing",
+                     missing_fact="a Vault token", smallest_input="vault login",
+                     tried=["the same route", "The Same Route"])
+    earned_block(led)
+    assert led.state["classifications"][0]["tried"]
+
+
+def test_a_block_parks_one_path_and_never_stops_the_run(led):
+    earned_block(led, park="F-deploy")
+    nxt = led.next_action()
+    assert nxt["required"] != "resolve_block", "a parked path must not be the next action"
+    assert any("F-deploy" in p for p in nxt["parked_paths"])
+    assert "continues meanwhile" in nxt["parked_note"]
+
+
+def test_a_parked_path_is_named_in_what_still_blocks_the_outcome(led):
+    earned_block(led, park="INC-deploy")
+    status, blocking, _ = led.outcome()
+    assert status == "NOT REACHED"
+    assert any("parked: INC-deploy" in r for r in blocking)
+
+
+def test_supplying_the_missing_fact_releases_the_parked_path(led):
+    earned_block(led)
+    assert led.outcome()[0] == "NOT REACHED"
     led.resolve_block("needs-vault-token", "operator ran `vault login`; token in env")
     verified(led)
-    assert led.outcome() == ("COMPLETE", [])
+    assert led.outcome() == ("REACHED", [], [])
 
 
-def test_a_criterion_left_unverified_by_a_block_is_blocked_not_failed(led):
-    led.classify("needs-vault-token", "information_missing",
-                 missing_fact="a Vault token", smallest_input="vault login")
-    status, reasons = led.outcome()
-    assert status == "BLOCKED"
-    assert not any("never checked" in r for r in reasons)
-    assert any("left unverified by the block" in r for r in reasons)
-
-
-def test_a_criterion_never_checked_with_nothing_blocking_is_a_failure(led):
-    status, reasons = led.outcome()
-    assert status == "FAILED VERIFICATION"
-    assert any("never checked" in r for r in reasons)
+def test_a_criterion_never_verified_means_the_outcome_was_not_reached(led):
+    status, blocking, _ = led.outcome()
+    assert status == "NOT REACHED"
+    assert any("never verified" in r for r in blocking)
 
 
 def test_a_resolved_block_stays_visible_in_the_report(led):
-    led.classify("needs-vault-token", "information_missing",
-                 missing_fact="a Vault token", smallest_input="vault login")
+    earned_block(led)
     led.resolve_block("needs-vault-token", "token supplied by the operator")
     verified(led)
     report = led.report()
@@ -275,30 +303,16 @@ def test_a_resolved_block_stays_visible_in_the_report(led):
     assert "(resolved)" in report
 
 
-def test_hypothesis_unresolved_forbids_starting_over(led):
-    armed(led)
-    led.open_hypothesis("H1", INCIDENT, "shared tmpdir", "a per-run dir removes the flake")
-    led.classify("flake-on-ci", "hypothesis_unresolved")
-    with pytest.raises(Blocked, match="untested hypothesis blocks"):
-        led.open_hypothesis("H2", INCIDENT, "clock skew", "freezing the clock fixes it")
-    led.close_hypothesis("H1", "per-run dir probe", "went green", survives=True)
-    assert led.state["directive"] is None
-
-
 def test_information_missing_must_name_the_fact_and_the_input(led):
+    tried = ["checked the env", "asked the endpoint"]
     with pytest.raises(UsageError, match="--missing-fact"):
-        led.classify("needs-vault-token", "information_missing", smallest_input="export VAULT_TOKEN")
+        led.classify("v", "information_missing", smallest_input="vault login", tried=tried)
     with pytest.raises(UsageError, match="--smallest-input"):
-        led.classify("needs-vault-token", "information_missing", missing_fact="a Vault token")
-    led.classify(
-        "needs-vault-token",
-        "information_missing",
-        missing_fact="a Vault token with read access",
-        smallest_input="the operator running `vault login`",
-    )
-    status, reasons = led.outcome()
-    assert status == "BLOCKED"
-    assert any("needs-vault-token" in r for r in reasons)
+        led.classify("v", "information_missing", missing_fact="a Vault token", tried=tried)
+    earned_block(led)
+    status, blocking, _ = led.outcome()
+    assert status == "NOT REACHED"
+    assert any("needs-vault-token" in r for r in blocking)
 
 
 
@@ -461,29 +475,29 @@ def test_a_clean_run_closes_complete(led):
     settled(led)
     led.record_evidence("handles CRLF", "pytest -k crlf", "executed_here", expected_source="literal")
     led.record_evidence("rejects malformed", "pytest -k malformed", "executed_here", expected_source="spec")
-    assert led.outcome() == ("COMPLETE", [])
+    assert led.outcome() == ("REACHED", [], [])
 
 
 def test_a_criterion_with_no_evidence_at_all_fails_verification(led):
     settled(led)
     led.record_evidence("handles CRLF", "pytest -k crlf", "executed_here")
-    assert led.outcome()[0] == "FAILED VERIFICATION"
+    assert led.outcome()[0] == "NOT REACHED"
 
 
 def test_evidence_that_could_not_be_gathered_never_counts_as_a_pass(led):
     settled(led)
     led.record_evidence("handles CRLF", "pytest -k crlf", "executed_here")
     led.record_evidence("rejects malformed", "pytest -k malformed", "unavailable", reason="no network")
-    assert led.outcome()[0] == "COMPLETE WITH RISKS"
+    assert led.outcome()[0] == "NOT REACHED"
 
 
 def test_an_untested_hypothesis_outranks_an_undecided_fork(led):
     armed(led)
     led.open_hypothesis("H1", INCIDENT, "newline mode", "mode would be 'r'")
     led.open_fork("F1", "which queue?", "broker gone", "redis", fork_options("sqs", "nats"))
-    status, reasons = led.outcome()
-    assert status == "FAILED VERIFICATION"
-    assert any("H1" in r for r in reasons)
+    status, blocking, _ = led.outcome()
+    assert status == "NOT REACHED"
+    assert any("H1" in r for r in blocking)
 
 
 def test_an_undecided_fork_blocks_an_otherwise_complete_run(led):
@@ -491,17 +505,17 @@ def test_an_undecided_fork_blocks_an_otherwise_complete_run(led):
     led.record_evidence("handles CRLF", "pytest -k crlf", "executed_here")
     led.record_evidence("rejects malformed", "pytest -k malformed", "executed_here")
     led.open_fork("F1", "which queue?", "broker gone", "redis", fork_options("sqs", "nats"))
-    assert led.outcome()[0] == "BLOCKED"
+    assert led.outcome()[0] == "NOT REACHED"
 
 
 def test_the_verdict_tracks_the_dispute_not_the_fork_count(led):
-    """A converged dispute must not make a clean COMPLETE unreachable."""
+    """A converged dispute must not make a clean verdict unreachable."""
     settled(led)
     verified(led)
     led.open_fork("F1", "which queue?", "broker gone", "redis", fork_options("sqs", "nats"))
     led.dispute("F1", challenger="reviewer", author="main", steelman="nats is better but unstaffed")
     led.decide("F1", "sqs", by="agent", invalidated=["US-004"])
-    assert led.outcome() == ("COMPLETE", [])
+    assert led.outcome() == ("REACHED", [], [])
 
 
 def test_a_blocking_risk_prevents_completion(led):
@@ -509,7 +523,7 @@ def test_a_blocking_risk_prevents_completion(led):
     led.record_evidence("handles CRLF", "pytest -k crlf", "executed_here")
     led.record_evidence("rejects malformed", "pytest -k malformed", "executed_here")
     led.record_risk("the public schema changed", blocking=True)
-    assert led.outcome()[0] == "BLOCKED"
+    assert led.outcome()[0] == "NOT REACHED"
 
 
 def test_the_report_carries_every_section_a_reviewer_needs(led):
@@ -521,7 +535,9 @@ def test_the_report_carries_every_section_a_reviewer_needs(led):
     for section in (
         "## Intent", "## Acceptance criteria", "## Work performed", "## Verification",
         "## Hypothesis ledger", "## Challenger findings", "## Conflicts and tradeoffs",
-        "## Decay risks", "## Human anchors", "## Residual uncertainty", "## Final status",
+        "## Decay risks", "## Human anchors",
+        "## What still stands between the run and the outcome",
+        "## How the outcome was reached", "## Final status",
     ):
         assert section in report
     assert "nats handles fan-out natively" in report
@@ -608,7 +624,7 @@ def test_close_writes_the_report_and_fails_loudly_when_unearned(tmp_path):
     run_cli("init", str(path), "--intent", "ship it", "--criterion", "works")
     result = run_cli("close", str(path))
     assert result.returncode == 3
-    assert "FAILED VERIFICATION" in result.stdout
+    assert "NOT REACHED" in result.stdout
     assert (path / "report.md").exists()
 
 
@@ -633,7 +649,7 @@ def test_a_full_run_closes_zero_through_the_cli(tmp_path):
             "--tier", "executed_here", "--expected-source", "literal")
     result = run_cli("close", str(path))
     assert result.returncode == 0
-    assert "**COMPLETE**" in result.stdout
+    assert "**REACHED**" in result.stdout
 
 
 def test_main_is_importable_for_in_process_gating(tmp_path):
@@ -691,24 +707,24 @@ def test_evidence_from_a_loop_you_declared_defective_does_not_close(led):
     settled(led)
     verified(led)
     led.classify("test-suite-red", "loop_defective")
-    status, reasons = led.outcome()
-    assert status == "FAILED VERIFICATION"
-    assert any("declared defective" in r for r in reasons)
+    status, blocking, _ = led.outcome()
+    assert status == "NOT REACHED"
+    assert any("defective" in r for r in blocking)
 
 
 def test_rebuilding_the_loop_lets_the_run_close(led):
     settled(led)
     verified(led)
     led.classify("test-suite-red", "loop_defective")
-    assert led.outcome()[0] == "FAILED VERIFICATION"
+    assert led.outcome()[0] == "NOT REACHED"
     led.declare_loop(INCIDENT, "pytest -k crlf --maxfail=1 -x", "the same failure, isolated")
     led.run_loop(INCIDENT, red=True)
     led.open_hypothesis("H4", INCIDENT, "the fixture order hides the second failure",
                         "isolating one test at a time reproduces it")
     led.close_hypothesis("H4", "per-test isolation probe", "reproduced: the 4th fixture alone", survives=True)
-    status, reasons = led.outcome()
-    assert status in ("COMPLETE", "COMPLETE WITH RISKS")
-    assert not any("defective" in r for r in reasons)
+    status, blocking, _ = led.outcome()
+    assert status == "REACHED", blocking
+    assert not any("defective" in r for r in blocking)
 
 
 def test_a_malformed_option_is_a_refusal_not_a_crash(led):
@@ -748,7 +764,7 @@ def test_a_converged_dispute_still_allows_a_clean_complete(led):
     led.open_fork("F1", "which queue?", "broker gone", "redis", fork_options("sqs", "nats"))
     led.dispute("F1", challenger="rev", author="main", steelman="nats is better, but unstaffed")
     led.decide("F1", "sqs", by="agent", invalidated=["US-1"])
-    assert led.outcome() == ("COMPLETE", [])
+    assert led.outcome() == ("REACHED", [], [])
 
 
 def test_overruling_the_challenger_costs_the_clean_verdict(led):
@@ -758,7 +774,87 @@ def test_overruling_the_challenger_costs_the_clean_verdict(led):
     led.dispute("F1", challenger="rev", author="main", steelman="nats is measurably better")
     led.decide("F1", "sqs", by="agent", invalidated=["US-1"],
                 challenger_overruled=True, override_reason="the counter-example did not reproduce")
-    status, reasons = led.outcome()
-    assert status == "COMPLETE WITH RISKS"
-    assert any("objection was overruled" in r for r in reasons)
-    assert "did not reproduce" in " ".join(reasons)
+    status, blocking, disclosed = led.outcome()
+    assert status == "REACHED", blocking
+    assert any("objection was overruled" in d for d in disclosed)
+    assert "did not reproduce" in " ".join(disclosed)
+
+
+# --------------------------------------------------------------------------- #
+# the right edge: the criteria list moves only through a disputed fork
+# --------------------------------------------------------------------------- #
+
+
+REV_OPTS = [
+    {"id": "keep", "cost": "0d", "risk": "low", "reversibility": "reversible"},
+    {"id": "revise", "cost": "1d", "risk": "med", "reversibility": "reversible"},
+]
+
+OLD_EDGE = "handles CRLF"
+NEW_EDGE = "handles CRLF and BOM-prefixed fixtures"
+
+
+def revision_fork(led):
+    led.open_fork(
+        "FR", "this criterion turned out to be unreachable as written",
+        "the fourth fixture carries a BOM and was never in the original report",
+        "keep", criterion_from=OLD_EDGE, criterion_to=NEW_EDGE, options=REV_OPTS,
+    )
+
+
+def test_the_right_edge_cannot_move_without_a_dispute(led):
+    revision_fork(led)
+    with pytest.raises(Blocked, match="no dispute"):
+        led.decide("FR", "revise", by="agent", invalidated=["AC-1"])
+    assert OLD_EDGE in led.state["criteria"]
+
+
+def test_revising_a_criterion_requires_naming_what_it_invalidates(led):
+    revision_fork(led)
+    led.dispute("FR", challenger="rev", author="main",
+                steelman="widening the criterion is how scope quietly shrinks")
+    with pytest.raises(Blocked, match="records nothing invalidated"):
+        led.decide("FR", "revise", by="agent")
+    assert led.state["criteria"] == ["handles CRLF", "rejects malformed"]
+
+
+def test_a_disputed_revision_moves_the_edge_and_still_has_to_be_verified(led):
+    settled(led)
+    verified(led)
+    revision_fork(led)
+    led.dispute("FR", challenger="rev", author="main",
+                steelman="widening the criterion is how scope quietly shrinks")
+    led.decide("FR", "revise", by="agent", invalidated=["AC-1 the CRLF test"])
+    assert OLD_EDGE not in led.state["criteria"]
+    assert NEW_EDGE in led.state["criteria"]
+    assert led.state["criterion_revisions"][0]["invalidated"] == ["AC-1 the CRLF test"]
+    status, blocking, disclosed = led.outcome()
+    assert status == "NOT REACHED"
+    assert any("never verified" in r for r in blocking), "the new edge starts unverified"
+    assert any("right edge was moved" in d for d in disclosed)
+    led.record_evidence(NEW_EDGE, "pytest -k crlf", "executed_here", expected_source="literal")
+    assert led.outcome() == ("REACHED", [], led.outcome()[2])
+
+
+def test_keeping_the_edge_closes_the_fork_without_moving_it(led):
+    settled(led)
+    verified(led)
+    revision_fork(led)
+    led.dispute("FR", challenger="rev", author="main", steelman="but the BOM is real")
+    led.decide("FR", "keep", by="agent")
+    assert led.state["criteria"] == ["handles CRLF", "rejects malformed"]
+    assert led.outcome() == ("REACHED", [], [])
+
+
+def test_a_revision_cannot_name_an_edge_that_does_not_exist(led):
+    with pytest.raises(UsageError, match="not a criterion of this run"):
+        led.open_fork("FR", "q", "t", "keep",
+                      criterion_from="a criterion nobody ever wrote",
+                      criterion_to="something else", options=REV_OPTS)
+
+
+def test_an_edge_cannot_be_moved_onto_an_edge_the_run_already_holds(led):
+    with pytest.raises(Blocked, match="already a criterion"):
+        led.open_fork("FR", "q", "t", "keep",
+                      criterion_from="handles CRLF",
+                      criterion_to="rejects malformed", options=REV_OPTS)
