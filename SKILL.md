@@ -96,6 +96,11 @@ needs to rebut it.
 Criteria are the unit of verification. Each one must be closeable by a command someone
 else could re-run. If you cannot name the command, the criterion is not a criterion yet.
 
+`record-evidence --criterion` must match the init-time text **exactly**. A near-miss used
+to open a second, uncancellable criterion and strand the run at `NOT REACHED` for reasons
+nobody could see; the machine now refuses it and tells you the closest real one. Copy the
+text from `status`, do not retype it from memory.
+
 ### The right edge does not move quietly
 
 `--intent` and the criteria are the two poles of the magnet. They are set once, at `init`,
@@ -195,10 +200,11 @@ $CONVERGENCE begin-fix "$LEDGER" --incident INC-1 --note "add the null guard" --
 ```
 
 `narrow` requires one settled explanation. It is recorded on the fix, shown in the report,
-and it costs the run its clean `COMPLETE`: the run closes as `COMPLETE WITH RISKS`, naming
-that the fix was chosen without searching over rivals. Use it when the defect is fully
-reproduced and you can say in one sentence why the mechanism is not in doubt. Use `full`
-the moment that sentence would be a guess.
+and it is **disclosed**: the run can still reach `REACHED`, but the report names it under
+"How the outcome was reached", saying the fix was chosen without searching over rivals.
+That disclosure outlives the run; the *verdict* is unaffected. Use `narrow` when the
+defect is fully reproduced and you can say in one sentence why the mechanism is not in
+doubt. Use `full` the moment that sentence would be a guess.
 
 The minimal honest sequence for a small change is therefore four commands: `init`,
 `declare-loop`, `run-loop`, then `open-hypothesis` → `refute`/`survive` → `begin-fix
@@ -252,6 +258,32 @@ you favour, that option is not demonstrated. Switch, or go find a better challen
 dispute that rubber-stamps your conclusion is worse than none, because it launders a
 preference into a verdict.
 
+### Not every fork deserves an expensive challenger
+
+Every fork is disputed — that gate does not move. But the *weight* of the challenger should
+follow what the decision binds, and the distinction is not subtle once you name it:
+
+| the fork is | challenger |
+|---|---|
+| a design that **binds a human, a public interface, or money** | a real adversarial subagent. Spend the minutes. |
+| a fact you simply **misremembered** ("the count was 3, it is 4 now") | a separate context that re-reads the artifact and says so. Seconds. |
+| **your own criterion** turning out to be wrong | still a real dispute — this moves the right edge — but the challenger attacks the *new* wording, not the architecture. |
+| **the machine** behaving differently than the run assumed | a re-read of `status`. This is diagnosis, not a decision. |
+
+Paying a heavyweight challenger for the bottom three is how a run spends most of its
+ledger budget on decisions nobody was bound by. It is also how you end up treating the
+dispute as a formality, which is the thing this entry exists to prevent.
+
+Record `record-risk` too — it is load-bearing and easy to miss:
+
+```bash
+$CONVERGENCE record-risk "$LEDGER" --text "the SQS poll interval is now 2s; not signed off yet"
+$CONVERGENCE record-risk "$LEDGER" --text "the public schema changed" --blocking
+```
+
+It is the only way to disclose a residual that no acceptance criterion captures. Without
+`--blocking` it is a disclosure; with it, it stands between the run and `REACHED`.
+
 ## B3. Decide inside your authority, or hand it to a human
 
 ```bash
@@ -286,12 +318,14 @@ $CONVERGENCE decide "$LEDGER" --fork F1 --chosen sqs --by agent \
 ```
 
 `--challenger-overruled` without a reason is refused. Overriding a dispute is allowed;
-overriding it silently is the thing this ledger exists to prevent. It also costs the run
-its clean `COMPLETE`.
+overriding it silently is the thing this ledger exists to prevent. It is **disclosed**:
+the run can still reach `REACHED`, but the report names the fork, your reason, and the
+fact that the challenge was overruled.
 
-The converse matters too: a dispute the challenger ran and the evidence then settled does
-**not** downgrade the verdict. The status tracks the quality of the decision, not how many
-forks the run happened to hit. An agent may legitimately reach `COMPLETE`.
+The converse matters too: a dispute the challenger ran and the evidence then settled
+discloses nothing. **Method notes never gate the verdict.** If you find yourself padding
+the hypothesis ledger to protect a status that was never at risk, stop — you are working
+from a stale copy of this document.
 
 ## B4. Resume
 
@@ -376,8 +410,9 @@ $CONVERGENCE record-evidence "$LEDGER" --criterion "handles CRLF" \
   `--recorder` and a *different* `--reproduced-by`. Equality is refused: re-reading your
   own summary is not reproduction.
 - `unavailable` — you could not get it. Requires `--reason`, and it is **never** a pass.
-  It closes the run as `COMPLETE WITH RISKS` and appears in the report under
-  `Unavailable`. Do not reach for it to get to a green result.
+  It makes the run `NOT REACHED` and appears in the report under both `Unavailable` and
+  "What still stands between the run and the outcome". Do not reach for it to get to a
+  green result; reach for whatever would let you actually verify the criterion.
 
 `--expected-source` is the anti-tautology control. The expectation must come from
 somewhere other than the implementation:

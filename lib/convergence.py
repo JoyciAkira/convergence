@@ -87,10 +87,18 @@ def _overlap(a, b):
     return len(ka & kb) / len(ka | kb)
 
 
+def _closest(needle, haystack):
+    """The nearest option above a similarity floor, or None. Used only to say
+    'did you mean' inside a refusal — never to accept a near-miss."""
+    scored = [(_overlap(needle, h), h) for h in haystack]
+    scored = [pair for pair in scored if pair[0] >= 0.4]
+    return max(scored)[1] if scored else None
+
+
 #: Rival explanations that must be settled before a fix, by declared search width.
-#: `narrow` is not a bypass: it is recorded on the fix, and it costs the run its clean
-#: COMPLETE. For a small, fully reproduced defect whose mechanism is unambiguous,
-#: demanding three rivals is theatre — but theatre the agent has to pay for out loud.
+#: `narrow` is not a bypass: it is recorded on the fix and disclosed in the report, so the
+#: choice survives even though the verdict is unaffected. For a small, fully reproduced
+#: defect whose mechanism is unambiguous, demanding three rivals is theatre.
 SEARCH_WIDTH = {"narrow": 1, "full": MIN_HYPOTHESES}
 
 #: Rows rendered per report section before the report points at the ledger instead.
@@ -325,6 +333,7 @@ def _ev_classify(s, ev):
             "smallest_input": ev.get("smallest_input"),
             "tried": ev.get("tried") or [],
             "park": ev.get("park"),
+            "only_route": ev.get("only_route"),
             "note": ev.get("note"),
             "at": ev["at"],
         }
@@ -725,7 +734,7 @@ class Ledger:
     @transactional
     def classify(
         self, signature, kind, missing_fact=None, smallest_input=None,
-        tried=(), park=None, note=None,
+        tried=(), park=None, note=None, only_route=None,
     ):
         self._enforce_directive("classify")
         kind = one_of(kind, tuple(DIRECTIVE_REQUIRES), "--kind")
@@ -735,12 +744,15 @@ class Ledger:
             req(missing_fact, "--missing-fact")
             req(smallest_input, "--smallest-input")
             distinct = {t.lower() for t in tried}
-            if len(distinct) < MIN_BLOCK_ROUTES:
+            if len(distinct) < MIN_BLOCK_ROUTES and not str(only_route or "").strip():
                 raise Blocked(
                     f"a block parks one path; it does not end the run. But it must be "
                     f"earned: record at least {MIN_BLOCK_ROUTES} distinct routes you "
                     f"already took to obtain {missing_fact!r} with --tried. A fact you "
-                    f"merely stopped looking for is not an unavailable fact."
+                    f"merely stopped looking for is not an unavailable fact. If there is "
+                    f"genuinely only one way to reach this fact — a missing binary, a "
+                    f"permission you do not hold, a capability that does not exist here — "
+                    f"say so with --only-route, and it is disclosed in the report."
                 )
         self._append(
             "control",
@@ -753,6 +765,7 @@ class Ledger:
                 "tried": tried,
                 "park": park,
                 "note": note,
+                "only_route": only_route,
             },
         )
         return self
@@ -974,6 +987,14 @@ class Ledger:
         output_ref=None,
     ):
         criterion = req(criterion, "--criterion")
+        if criterion not in self.state["criteria"]:
+            near = _closest(criterion, self.state["criteria"])
+            raise Blocked(
+                f"{criterion!r} is not a criterion of this run, so evidence against it could "
+                f"never close anything and would fail silently as NOT REACHED."
+                + (f" Did you mean {near!r}? The text must match exactly." if near else "")
+                + f" Current: {self.state['criteria']}"
+            )
         command = req(command, "--command")
         tier = one_of(tier, EVIDENCE_TIERS, "--tier")
         if expected_source is not None:
@@ -1103,6 +1124,12 @@ class Ledger:
         nonterminal = sorted({
             c["signature"] for c in s["classifications"] if c["kind"] != "information_missing"
         })
+        solo_route = [c for c in s["classifications"] if c.get("only_route")]
+        if solo_route:
+            disclosed.append(
+                "blocks taken on the word that there was no other route: "
+                + ", ".join(f"{c['signature']} ({c['only_route']})" for c in solo_route)
+            )
         if nonterminal:
             disclosed.append(
                 "repeated non-convergence kept this run alive past its own diagnosis: "
@@ -1366,6 +1393,10 @@ def _build_parser():
     node.add_argument("--park",
                       help="the path this block parks (a fork id, incident id, or tag). "
                            "The run continues elsewhere.")
+    node.add_argument("--only-route",
+                      help="when there is genuinely one way to reach the fact — a missing "
+                           "binary, a permission you do not hold — say why here instead of "
+                           "listing routes that do not exist. Disclosed in the report.")
     node.add_argument("--note")
 
     node = add("resolve-block", "clear a missing-fact block once the input arrives")
@@ -1463,7 +1494,7 @@ def _dispatch(args):
     elif command == "classify":
         ledger.classify(
             args.signature, args.kind, args.missing_fact, args.smallest_input,
-            tried=args.tried, park=args.park, note=args.note,
+            tried=args.tried, park=args.park, note=args.note, only_route=args.only_route,
         )
     elif command == "resolve-block":
         ledger.resolve_block(args.signature, args.provided)

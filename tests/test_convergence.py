@@ -900,12 +900,13 @@ def test_two_agents_racing_to_record_the_same_hypothesis_cannot_both_win(tmp_pat
 
 def test_concurrent_distinct_work_is_never_lost(tmp_path):
     path = tmp_path / "L"
-    led = Ledger.create(path, "x", [])
+    words = ["clock", "socket", "kernel", "cursor", "manifest", "padding",
+             "locale", "checksum", "timeout", "segment", "vacuum", "trigger"]
+    criteria = [f"criterion-{i:02d} is satisfied" for i in range(len(words))]
+    led = Ledger.create(path, "x", criteria)
     led.declare_loop(INCIDENT, "pytest -k crlf", "many failures")
     led.run_loop(INCIDENT, red=True)
 
-    words = ["clock", "socket", "kernel", "cursor", "manifest", "padding",
-             "locale", "checksum", "timeout", "segment", "vacuum", "trigger"]
     gate = threading.Barrier(len(words))
 
     def worker(i):
@@ -914,7 +915,7 @@ def test_concurrent_distinct_work_is_never_lost(tmp_path):
         other.open_hypothesis(f"H{i:02d}", INCIDENT,
                               f"the {words[i]} is left unwritten",
                               f"isolating the {words[i]} path turns the check green")
-        other.record_evidence(f"criterion-{i:02d}", f"pytest -k e{i}",
+        other.record_evidence(criteria[i], f"pytest -k e{i}",
                               "executed_here", expected_source="literal")
         return i
 
@@ -953,3 +954,43 @@ def test_a_contested_fork_is_decided_exactly_once(tmp_path):
         if line.strip() and json.loads(line)["ev"] == "decide"
     ]
     assert len(events) == 1, "two decisions landed and one silently overwrote the other"
+
+
+# --------------------------------------------------------------------------- #
+# found by the first real agent to use the skill
+# --------------------------------------------------------------------------- #
+
+
+def test_evidence_against_a_criterion_that_does_not_exist_is_refused(led):
+    """A near-miss used to open a second criterion that could never be closed."""
+    with pytest.raises(Blocked, match="not a criterion of this run") as exc:
+        led.record_evidence("handles crlf", "pytest -k crlf", "executed_here")
+    assert "handles CRLF" in str(exc.value), "the refusal should name the real one"
+    assert led.state["evidence"] == []
+
+
+def test_a_single_route_block_needs_to_say_why_and_is_disclosed(led):
+    with pytest.raises(Blocked, match="only-route"):
+        led.classify("missing-binary", "information_missing",
+                     missing_fact="the container runtime binary",
+                     smallest_input="the operator installs it",
+                     tried=["which docker returned nothing"])
+    led.classify("missing-binary", "information_missing",
+                 missing_fact="the container runtime binary",
+                 smallest_input="the operator installs it",
+                 tried=["which docker returned nothing"],
+                 only_route="there is no container runtime on this host to try")
+    status, blocking, disclosed = led.outcome()
+    assert status == "NOT REACHED"
+    assert any("missing-binary" in r for r in blocking)
+    assert any("no other route" in d for d in disclosed)
+
+
+def test_two_distinct_routes_still_satisfy_the_block_without_only_route(led):
+    led.classify("needs-token", "information_missing",
+                 missing_fact="a Vault token",
+                 smallest_input="the operator runs vault login",
+                 tried=["checked the environment", "asked the secrets endpoint"])
+    assert led.state["classifications"][0].get("only_route") is None
+    _, _, disclosed = led.outcome()
+    assert not any("no other route" in d for d in disclosed)
