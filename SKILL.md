@@ -54,6 +54,24 @@ $CONVERGENCE next-action "$LEDGER"     # what the ledger requires of you, right 
 
 Run that whenever you are unsure. It is derived state, not advice.
 
+### Several agents, one ledger
+
+This is supported and intended: a team of agents working the same run holds an advisory
+lock across the whole read-validate-write section. Every mutator re-reads the ledger
+under that lock before it checks anything, so a gate you pass is a gate that was true at
+the instant your write landed.
+
+What that means in practice:
+
+- Two agents racing to record the same hypothesis: **one wins**, the other is refused.
+- Two agents racing to close the same fork: **one decision lands**, once. There is no
+  silent overwrite and no lost decision.
+- Concurrent distinct work is never dropped — every accepted event survives to replay.
+
+So you do not need to partition the ledger between agents. You do need to expect a
+`BLOCKED` that is really *"someone else got there first"*; re-read `status` and move on
+rather than retrying the identical call.
+
 `status` prints the whole derived state as a **flat JSON object at the top level** — no
 `state` wrapper. It is meant for scripts and for `grep`; do not paste it into a prompt on a
 large run, it grows with the ledger. Use `next-action` and `close` when you want to read.

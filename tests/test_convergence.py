@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -858,3 +860,96 @@ def test_an_edge_cannot_be_moved_onto_an_edge_the_run_already_holds(led):
         led.open_fork("FR", "q", "t", "keep",
                       criterion_from="handles CRLF",
                       criterion_to="rejects malformed", options=REV_OPTS)
+
+
+# --------------------------------------------------------------------------- #
+# several agents, one ledger
+# --------------------------------------------------------------------------- #
+
+
+def test_two_agents_racing_to_record_the_same_hypothesis_cannot_both_win(tmp_path):
+    """The padding guard is the whole point of the ledger, and agents run in parallel.
+
+    Each thread is a separate agent that loaded its state before the race started, so
+    without a lock every one of them validates against the same pre-write view and every
+    one of them lands. Exactly one may win.
+    """
+    path = tmp_path / "L"
+    led = Ledger.create(path, "x", [])
+    led.declare_loop(INCIDENT, "pytest -k crlf", "the guard is missing")
+    led.run_loop(INCIDENT, red=True)
+
+    workers = 8
+    gate = threading.Barrier(workers)
+
+    def race(i):
+        other = Ledger(path)
+        gate.wait()
+        try:
+            other.open_hypothesis(f"H{i}", INCIDENT, "the null guard is absent",
+                                  "adding it turns the loop green")
+            return "won"
+        except Blocked:
+            return "refused"
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        outcomes = list(pool.map(race, range(workers)))
+    assert outcomes.count("won") == 1, outcomes
+    assert len(Ledger(path).state["hypotheses"]) == 1
+
+
+def test_concurrent_distinct_work_is_never_lost(tmp_path):
+    path = tmp_path / "L"
+    led = Ledger.create(path, "x", [])
+    led.declare_loop(INCIDENT, "pytest -k crlf", "many failures")
+    led.run_loop(INCIDENT, red=True)
+
+    words = ["clock", "socket", "kernel", "cursor", "manifest", "padding",
+             "locale", "checksum", "timeout", "segment", "vacuum", "trigger"]
+    gate = threading.Barrier(len(words))
+
+    def worker(i):
+        other = Ledger(path)
+        gate.wait()
+        other.open_hypothesis(f"H{i:02d}", INCIDENT,
+                              f"the {words[i]} is left unwritten",
+                              f"isolating the {words[i]} path turns the check green")
+        other.record_evidence(f"criterion-{i:02d}", f"pytest -k e{i}",
+                              "executed_here", expected_source="literal")
+        return i
+
+    with ThreadPoolExecutor(max_workers=len(words)) as pool:
+        list(pool.map(worker, range(len(words))))
+
+    final = Ledger(path)
+    assert len(final.state["hypotheses"]) == len(words)
+    assert len(final.state["evidence"]) == len(words)
+
+
+def test_a_contested_fork_is_decided_exactly_once(tmp_path):
+    path = tmp_path / "L"
+    led = Ledger.create(path, "x", [])
+    led.open_fork("F1", "which queue?", "broker gone", "redis", fork_options("sqs", "nats"))
+    led.dispute("F1", challenger="rev", author="main", steelman="nats is better")
+
+    workers = 8
+    gate = threading.Barrier(workers)
+
+    def race(i):
+        other = Ledger(path)
+        gate.wait()
+        try:
+            other.decide("F1", "sqs", by="agent", invalidated=[f"US-{i}"])
+            return "won"
+        except Blocked:
+            return "refused"
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        outcomes = list(pool.map(race, range(workers)))
+    assert outcomes.count("won") == 1, outcomes
+    events = [
+        json.loads(line)
+        for line in (path / "forks.jsonl").read_text().splitlines()
+        if line.strip() and json.loads(line)["ev"] == "decide"
+    ]
+    assert len(events) == 1, "two decisions landed and one silently overwrote the other"

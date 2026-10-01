@@ -20,15 +20,24 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
+import functools
 import json
 import re
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 LEDGER_VERSION = 2
 
 OK = 0
+
+#: Advisory lock held across the whole read-validate-write section. Several agents are
+#: expected to drive one ledger; without this, two of them racing to record the same
+#: hypothesis both validate against the same pre-write state and both land, and the
+#: padding guard becomes advisory.
+LOCK = ".lock"
 USAGE = 2
 BLOCKED = 3
 
@@ -129,6 +138,17 @@ LOGS = {
 #: a reason it was not, not a lesser kind of success. A run that ends any other way is
 #: still going, and `next-action` says what it is waiting on.
 FINAL_STATUSES = ("REACHED", "NOT REACHED")
+
+
+def transactional(fn):
+    """Run a mutator against a freshly replayed state, under the ledger lock."""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self.transaction():
+            return fn(self, *args, **kwargs)
+
+    return wrapper
 
 #: A block must be earned: this many distinct routes must have been tried and recorded
 #: before a missing fact counts as unobtainable rather than merely unlooked-for. Without
@@ -433,8 +453,31 @@ class Ledger:
         self.state = empty_state()
         if not self.root.exists():
             raise UsageError(f"ledger directory does not exist: {self.root}")
+        self._replay_all()
+
+    # -- plumbing ----------------------------------------------------------- #
+
+    def _replay_all(self):
+        self.state = empty_state()
         for name in ("control", "hypotheses", "forks", "evidence"):
             self._replay(self.root / LOGS[name])
+
+    @contextmanager
+    def transaction(self):
+        """Hold the ledger lock across read-validate-write, against fresh state.
+
+        Several agents are expected to drive one ledger. Validating against a state
+        loaded at construction time is not enough: another process may land a write
+        between our read and our append, and the gate we just passed would then be
+        stale. Everything a mutator checks and writes happens inside this section.
+        """
+        with (self.root / LOCK).open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                self._replay_all()
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
     # -- plumbing ----------------------------------------------------------- #
 
@@ -519,20 +562,30 @@ class Ledger:
     @classmethod
     def create(cls, root, intent, criteria=()):
         root = Path(root)
-        if (root / LOGS["control"]).exists():
-            raise Blocked(f"ledger already initialised: {root}")
         root.mkdir(parents=True, exist_ok=True)
-        for name in LOGS.values():
-            (root / name).touch()
-        ledger = cls(root)
-        ledger._append(
-            "control",
-            {"ev": "init", "intent": req(intent, "--intent"), "criteria": list(criteria or [])},
-        )
-        return ledger
+        with (root / LOCK).open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                if (root / LOGS["control"]).exists():
+                    raise Blocked(f"ledger already initialised: {root}")
+                for name in LOGS.values():
+                    (root / name).touch()
+                ledger = cls(root)
+                ledger._append(
+                    "control",
+                    {
+                        "ev": "init",
+                        "intent": req(intent, "--intent"),
+                        "criteria": list(criteria or []),
+                    },
+                )
+                return ledger
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
     # -- entry A: the feedback loop ----------------------------------------- #
 
+    @transactional
     def declare_loop(self, incident, command, symptom):
         self._enforce_directive("declare_loop")
         self._append(
@@ -546,6 +599,7 @@ class Ledger:
         )
         return self
 
+    @transactional
     def run_loop(self, incident, red):
         self._enforce_directive("run_loop")
         incident = req(incident, "--incident")
@@ -554,6 +608,7 @@ class Ledger:
         self._append("control", {"ev": "loop_run", "incident": incident, "red": bool(red)})
         return self
 
+    @transactional
     def open_hypothesis(self, ident, incident, claim, prediction, rank=None):
         self._enforce_directive("hyp_open")
         incident = req(incident, "--incident")
@@ -591,6 +646,7 @@ class Ledger:
         self._clear_directive("hyp_open")
         return self
 
+    @transactional
     def close_hypothesis(self, ident, probe, observed, survives):
         action = "hyp_survive" if survives else "hyp_refute"
         self._enforce_directive(action)
@@ -611,6 +667,7 @@ class Ledger:
         self._clear_directive(action)
         return self
 
+    @transactional
     def merge_hypotheses(self, into, source, note):
         self._enforce_directive("hyp_merge")
         self._append(
@@ -625,6 +682,7 @@ class Ledger:
         self._clear_directive("hyp_merge")
         return self
 
+    @transactional
     def begin_fix(self, incident, note, search="full"):
         self._enforce_directive("begin_fix")
         search = one_of(search, tuple(SEARCH_WIDTH), "--search")
@@ -664,6 +722,7 @@ class Ledger:
 
     # -- entry C: non-convergence ------------------------------------------ #
 
+    @transactional
     def classify(
         self, signature, kind, missing_fact=None, smallest_input=None,
         tried=(), park=None, note=None,
@@ -698,6 +757,7 @@ class Ledger:
         )
         return self
 
+    @transactional
     def resolve_block(self, signature, provided):
         self._append(
             "control",
@@ -711,6 +771,7 @@ class Ledger:
 
     # -- entry B: forks and disputes ---------------------------------------- #
 
+    @transactional
     def open_fork(
         self, ident, question, trigger, assumed, options,
         invalidation_rationale=None, criterion_from=None, criterion_to=None,
@@ -771,6 +832,7 @@ class Ledger:
         )
         return self
 
+    @transactional
     def dispute(self, fork, challenger, author, steelman, verdict=None):
         fork = req(fork, "--fork")
         challenger = req(challenger, "--challenger")
@@ -796,6 +858,7 @@ class Ledger:
         )
         return self
 
+    @transactional
     def decide(
         self,
         fork,
@@ -898,6 +961,7 @@ class Ledger:
 
     # -- evidence ----------------------------------------------------------- #
 
+    @transactional
     def record_evidence(
         self,
         criterion,
@@ -946,6 +1010,7 @@ class Ledger:
         )
         return self
 
+    @transactional
     def record_risk(self, text, blocking=False):
         self._append(
             "control",
