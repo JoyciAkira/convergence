@@ -147,7 +147,10 @@ LOGS = {
 #: the world instead of waiting for a human to paste values, copy node_modules, or
 #: provision a database by hand. Each one records its action in the ledger so the
 #: audit trail survives.
-INFRA_COMMANDS = ("provision-env", "inject-build-context", "store-secret")
+INFRA_COMMANDS = (
+    "provision-env", "inject-build-context", "store-secret",
+    "boot-runtime", "stop-runtime",
+)
 
 #: The magnet has two poles and one question: was the outcome reached? Everything else is
 #: a reason it was not, not a lesser kind of success. A run that ends any other way is
@@ -169,6 +172,109 @@ def transactional(fn):
 #: before a missing fact counts as unobtainable rather than merely unlooked-for. Without
 #: it, "never stop" becomes "never try", and the block is a give-up button.
 MIN_BLOCK_ROUTES = 2
+
+#: Words indicating the smallest input names an external actor, not an action the run
+#: can take. When one of these is present the fact genuinely lives outside the session
+#: and parking it is legitimate.
+DELEGATE_ACTORS = (
+    "operator", "human", "user", "admin", "someone with", "permission",
+    "credentials", "approval", "invite", "purchase", "paid plan", "account",
+    "pasted", "paste", "email", "support",
+)
+
+#: Imperative verbs that signal an executable action rather than an unobtainable fact.
+ACTION_VERBS = (
+    "start", "run", "launch", "boot", "restart", "execute", "install", "sync",
+    "copy", "inject", "generate", "build", "fix", "create", "provision", "seed",
+    "migrate", "bind", "serve", "enable", "setup", "set up",
+)
+
+#: Common local tool names: their presence means the action could be run in-session.
+LOCAL_TOOLS = (
+    "next", "next.js", "npm", "npx", "pnpm", "yarn", "node", "python", "python3",
+    "pip", "pip3", "pytest", "docker", "docker-compose", "make", "cargo", "go",
+    "cp", "mv", "mkdir", "prisma", "vite", "webpack", "tsc", "git", "curl",
+)
+
+_FILE_TOKEN_RE = re.compile(
+    r"[\w.-]+\.(?:tsx?|jsx?|mjs|cjs|py|json|env|ya?ml|toml|lock|sh|db|sqlite)\b"
+)
+
+
+def _looks_like_local_action(text):
+    """True when a smallest-input describes work this session could actually do.
+
+    The flow-parity failure mode: a bootable server described as missing information.
+    An input that pairs imperative verbs with local tools or project files is work,
+    not a fact. Facts name actors and permissions; work names commands.
+    """
+    if not text:
+        return False
+    t = text.lower()
+    if any(tok in t for tok in DELEGATE_ACTORS):
+        return False
+    has_verb = any(
+        re.search(rf"\b{re.escape(v)}\b", t) for v in ACTION_VERBS
+    )
+    has_local = (
+        bool({w.strip(".") for w in t.split()} & set(LOCAL_TOOLS))
+        or bool(_FILE_TOKEN_RE.search(t))
+        or "/" in t
+    )
+    return has_verb and has_local
+
+
+def _free_port():
+    """Ask the kernel for a port that is free right now."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _port_open(port, host="127.0.0.1"):
+    """True when something already accepts TCP connections on this port."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, int(port))) == 0
+
+
+def _tail(path, lines=10):
+    try:
+        return "\n".join(Path(path).read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return "(no output captured)"
+
+
+def _kill_process(pid):
+    """SIGTERM a process group started with start_new_session, then SIGKILL as fallback."""
+    import os
+    import signal
+    import time
+
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            # EPERM on signal 0 means a zombie: dead, sockets released, un-reaped.
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 #: The right edge is the criteria list. It is set once and moves only through a disputed,
 #: recorded fork — never by editing, and never silently.
@@ -471,6 +577,31 @@ def _ev_store_secret(s, ev):
     )
 
 
+def _ev_boot_runtime(s, ev):
+    s.setdefault("infra", {}).setdefault("runtimes", []).append(
+        {
+            "name": ev["name"],
+            "command": ev["command"],
+            "port": ev["port"],
+            "url": ev["url"],
+            "pid": ev["pid"],
+            "log": ev["log"],
+            "stopped": False,
+            "booted_at": ev["at"],
+        }
+    )
+
+
+def _ev_stop_runtime(s, ev):
+    runtimes = s.setdefault("infra", {}).setdefault("runtimes", [])
+    for rt in runtimes:
+        if rt["name"] == ev["name"] and not rt.get("stopped"):
+            rt["stopped"] = True
+            rt["stopped_at"] = ev["at"]
+            return
+    raise Blocked(f"no running runtime named {ev['name']!r}")
+
+
 _HANDLERS = {
     "init": _ev_init,
     "loop_declare": _ev_loop_declare,
@@ -492,6 +623,8 @@ _HANDLERS = {
     "provision_env": _ev_provision_env,
     "inject_build_context": _ev_inject_build_context,
     "store_secret": _ev_store_secret,
+    "boot_runtime": _ev_boot_runtime,
+    "stop_runtime": _ev_stop_runtime,
 }
 
 
@@ -787,6 +920,16 @@ class Ledger:
         if kind == "information_missing":
             req(missing_fact, "--missing-fact")
             req(smallest_input, "--smallest-input")
+            if _looks_like_local_action(smallest_input) and not str(only_route or "").strip():
+                raise Blocked(
+                    f"the smallest input for {signature!r} describes work this session "
+                    f"can do, not a fact outside its reach: {smallest_input!r}. Do the "
+                    f"work: boot-runtime for a server the criteria need, provision-env "
+                    f"for a dependency, inject-build-context for build artifacts — then "
+                    f"release the block with resolve-block. A park is for facts nobody "
+                    f"here can create. If an external actor or permission is genuinely "
+                    f"required, say so with --only-route and it is disclosed in the report."
+                )
             distinct = {t.lower() for t in tried}
             if len(distinct) < MIN_BLOCK_ROUTES and not str(only_route or "").strip():
                 raise Blocked(
@@ -1153,6 +1296,129 @@ class Ledger:
         )
         return self
 
+    # -- runtimes ----------------------------------------------------------- #
+
+    def boot_runtime(
+        self, name, command, cwd=None, port=None, path="/", timeout=30.0,
+        resolve_signature=None, criterion=None,
+    ):
+        """Start a local runtime for a generated project and wait for its listener.
+
+        This is the arm that turns "the sandbox is not startable" parks into a
+        running URL: pick a free port, start the command (a {port} placeholder in
+        the command is substituted), poll until something accepts connections, then
+        record the runtime and optionally release a parked block and record
+        listener evidence. The server keeps running after this returns so e2e
+        criteria can be verified against it; `stop-runtime` retires it.
+        """
+        import subprocess
+
+        name = req(name, "--name")
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", name)
+        command = req(command, "--command")
+        timeout = max(float(timeout or 30.0), 1.0)
+        path = path or "/"
+
+        if "{port}" not in command:
+            raise UsageError(
+                'the command must contain a {port} placeholder, e.g. '
+                '"npx next dev -p {port}", so boot-runtime knows where the '
+                'listener will come up'
+            )
+        if port is not None:
+            port = int(port)
+            if not 0 < port < 65536:
+                raise UsageError(f"--port must be between 1 and 65535, got {port}")
+            if _port_open(port):
+                raise Blocked(
+                    f"--port {port} is already in use; boot-runtime never starts a "
+                    f"second server on a bound port. Omit --port to have a free "
+                    f"one chosen."
+                )
+        else:
+            port = _free_port()
+        actual_command = command.replace("{port}", str(port))
+
+        runtimes_dir = self.root / "runtimes"
+        runtimes_dir.mkdir(parents=True, exist_ok=True)
+        log_path = runtimes_dir / f"{safe_name}.log"
+        with log_path.open("w", encoding="utf-8") as log_file:
+            proc = subprocess.Popen(
+                actual_command,
+                shell=True,
+                cwd=str(cwd) if cwd else None,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if _port_open(port):
+                    break
+                if proc.poll() is not None:
+                    raise Blocked(
+                        f"runtime {name!r} exited before accepting connections "
+                        f"(exit code {proc.returncode}). Tail of {log_path}: "
+                        f"{_tail(log_path)}"
+                    )
+                time.sleep(0.25)
+            else:
+                _kill_process(proc.pid)
+                raise Blocked(
+                    f"runtime {name!r} did not accept connections on port {port} "
+                    f"within {timeout:g}s. Tail of {log_path}: {_tail(log_path)}"
+                )
+
+        url = f"http://127.0.0.1:{port}{path}"
+        with self.transaction():
+            self._append(
+                "control",
+                {
+                    "ev": "boot_runtime",
+                    "name": name,
+                    "command": actual_command,
+                    "port": port,
+                    "url": url,
+                    "pid": proc.pid,
+                    "log": str(log_path),
+                },
+            )
+        if resolve_signature:
+            self.resolve_block(
+                resolve_signature,
+                f"boot-runtime started {name!r} listening on {url} (pid {proc.pid}); "
+                f"log at {log_path}",
+            )
+        if criterion:
+            self.record_evidence(
+                criterion,
+                f"curl -s -o /dev/null -w '%{{http_code}}' {url}",
+                "executed_here",
+                expected_source="literal",
+                reason=f"runtime {name!r} accepted connections on {url}",
+            )
+        print(f"boot-runtime: {name} listening on {url} (pid {proc.pid})")
+        return self
+
+    @transactional
+    def stop_runtime(self, name):
+        """Retire a runtime previously started with boot-runtime."""
+        name = req(name, "--name")
+        runtimes = self.state.get("infra", {}).get("runtimes", [])
+        target = next(
+            (rt for rt in runtimes if rt["name"] == name and not rt.get("stopped")),
+            None,
+        )
+        if target is None:
+            running = [rt["name"] for rt in runtimes if not rt.get("stopped")]
+            raise Blocked(
+                f"no running runtime named {name!r} in this ledger; "
+                f"running: {running or 'none'}"
+            )
+        _kill_process(target["pid"])
+        self._append("control", {"ev": "stop_runtime", "name": name})
+        return self
+
     # -- preflight ---------------------------------------------------------- #
 
     def validate_infra(self, fix=False):
@@ -1239,6 +1505,23 @@ class Ledger:
                     "ok": False,
                     "detail": str(exc),
                 })
+
+        # Check booted runtimes: verify the recorded listener still accepts connections
+        for rt in infra.get("runtimes", []):
+            if rt.get("stopped"):
+                continue
+            ok = _port_open(rt["port"])
+            checks.append({
+                "type": "runtime",
+                "name": rt["name"],
+                "url": rt["url"],
+                "ok": ok,
+                "detail": (
+                    "listening"
+                    if ok
+                    else f"not listening on port {rt['port']} (pid {rt.get('pid')})"
+                ),
+            })
 
         # Check external tools referenced in loops and evidence commands.
         # Commands may start with env-var assignments (VAR=val cmd) or command
@@ -1799,6 +2082,28 @@ def _build_parser():
     node.add_argument("--command", required=True,
                       help="retrieval command (value never touches ledger or transcript)")
 
+    node = add("boot-runtime", "start a local runtime on a free port and wait for its listener")
+    node.add_argument("--name", required=True,
+                      help="runtime identifier (e2e-sandbox, preview-server)")
+    node.add_argument("--command", required=True,
+                      help='startup command; a {port} placeholder is substituted, '
+                           'e.g. "npx next dev -p {port}"')
+    node.add_argument("--cwd", help="working directory for the command")
+    node.add_argument("--port", type=int,
+                      help="pin the port (must be free); default: pick a free one")
+    node.add_argument("--path", default="/",
+                      help="URL path the readiness evidence points at (default /)")
+    node.add_argument("--timeout", type=float, default=30.0,
+                      help="seconds to wait for the listener (default 30)")
+    node.add_argument("--resolve-signature",
+                      help="also resolve-block this signature once the listener is up")
+    node.add_argument("--criterion",
+                      help="also record executed_here listener evidence for this criterion")
+
+    node = add("stop-runtime", "stop a runtime previously started with boot-runtime")
+    node.add_argument("--name", required=True,
+                      help="the runtime identifier given to boot-runtime")
+
     node = add("validate-infra", "preflight check: verify all infra prerequisites are available")
     node.add_argument("--fix", action="store_true",
                       help="attempt to restore missing prerequisites by re-running "
@@ -1900,6 +2205,14 @@ def _dispatch(args):
         )
     elif command == "store-secret":
         ledger.store_secret(args.name, args.command)
+    elif command == "boot-runtime":
+        ledger.boot_runtime(
+            args.name, args.command, cwd=args.cwd, port=args.port, path=args.path,
+            timeout=args.timeout, resolve_signature=args.resolve_signature,
+            criterion=args.criterion,
+        )
+    elif command == "stop-runtime":
+        ledger.stop_runtime(args.name)
     elif command == "validate-infra":
         result = ledger.validate_infra(fix=getattr(args, 'fix', False))
         print(json.dumps(result, indent=2, sort_keys=True))

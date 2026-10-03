@@ -994,3 +994,154 @@ def test_two_distinct_routes_still_satisfy_the_block_without_only_route(led):
     assert led.state["classifications"][0].get("only_route") is None
     _, _, disclosed = led.outcome()
     assert not any("no other route" in d for d in disclosed)
+
+
+# --------------------------------------------------------------------------- #
+# work is not a fact: the anti-park guard
+# --------------------------------------------------------------------------- #
+
+
+def test_a_smallest_input_describing_local_work_is_refused_as_a_park(led):
+    with pytest.raises(Blocked, match="work this session"):
+        led.classify(
+            "sandbox-e2e-unavailable",
+            "information_missing",
+            missing_fact="A running Next.js instance serving the generated project",
+            smallest_input=(
+                "Fix sandbox-server.ts port binding or sync generated files into a "
+                "servable directory and start next dev on a free port"
+            ),
+            tried=["next dev on 4321 refused", "lsof shows no listener"],
+            park="C2 F4",
+        )
+    assert led.state["classifications"] == [], "the park must never reach the ledger"
+
+
+def test_the_guard_message_names_the_arms_that_do_the_work(led):
+    with pytest.raises(Blocked, match="boot-runtime"):
+        led.classify("sig", "information_missing",
+                     missing_fact="a running server",
+                     smallest_input="start npm run dev in the project directory",
+                     tried=["tried once", "tried twice"])
+
+
+def test_only_route_discloses_the_way_out_instead_of_refusing(led):
+    led.classify("needs-vault-token", "information_missing",
+                 missing_fact="a Vault token",
+                 smallest_input="start the vault dev server and read the token",
+                 tried=["checked the env", "asked the endpoint"],
+                 only_route="requires an operator account we do not hold")
+    assert led.state["classifications"][0]["only_route"]
+
+
+def test_a_delegate_actor_still_parks_legitimately(led):
+    earned_block(led)
+    assert led.state["classifications"][0]["signature"] == "needs-vault-token"
+
+
+def test_a_fact_without_an_action_verb_is_never_guarded(led):
+    led.classify("needs-quota", "information_missing",
+                 missing_fact="paid API quota",
+                 smallest_input="a billing account with remaining quota",
+                 tried=["no key in env", "status endpoint shows zero quota"])
+    assert led.state["classifications"][0]["signature"] == "needs-quota"
+
+
+# --------------------------------------------------------------------------- #
+# boot-runtime: a running server instead of a parked path
+# --------------------------------------------------------------------------- #
+
+
+def _port_open(port):
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", int(port))) == 0
+
+
+def test_boot_runtime_picks_a_free_port_and_stop_runtime_retires_it(tmp_path):
+    import time
+
+    led = Ledger.create(tmp_path / "L", "serve e2e", ["serve the page"])
+    led.boot_runtime("e2e-sandbox", "python3 -m http.server {port} --bind 127.0.0.1")
+    rt = led.state["infra"]["runtimes"][0]
+    assert rt["name"] == "e2e-sandbox" and not rt["stopped"]
+    assert rt["url"].startswith("http://127.0.0.1:")
+    assert _port_open(rt["port"]), "the listener must actually be up"
+    led.stop_runtime("e2e-sandbox")
+    assert led.state["infra"]["runtimes"][0]["stopped"]
+    for _ in range(30):
+        if not _port_open(rt["port"]):
+            break
+        time.sleep(0.1)
+    assert not _port_open(rt["port"]), "stop-runtime must actually kill the server"
+
+
+def test_boot_runtime_releases_a_parked_block_and_records_listener_evidence(tmp_path):
+    led = Ledger.create(tmp_path / "L", "serve e2e", ["serve the page"])
+    led.classify("sandbox-e2e-unavailable", "information_missing",
+                 missing_fact="a running server",
+                 smallest_input="the operator starts the preview server",
+                 tried=["no server on 4321", "no server on 4399"],
+                 park="F-e2e")
+    led.boot_runtime(
+        "e2e-sandbox",
+        "python3 -m http.server {port} --bind 127.0.0.1",
+        resolve_signature="sandbox-e2e-unavailable",
+        criterion="serve the page",
+    )
+    assert any(b["signature"] == "sandbox-e2e-unavailable"
+               for b in led.state["resolved_blocks"])
+    ev = led.state["evidence"][-1]
+    assert ev["criterion"] == "serve the page"
+    assert ev["tier"] == "executed_here"
+    assert ev["expected_source"] == "literal"
+
+
+def test_boot_runtime_refuses_an_already_bound_port(tmp_path):
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        bound = sock.getsockname()[1]
+        sock.listen(1)
+        led = Ledger.create(tmp_path / "L", "serve e2e", ["serve the page"])
+        with pytest.raises(Blocked, match="already in use"):
+            led.boot_runtime(
+                "e2e-sandbox",
+                "python3 -m http.server {port} --bind 127.0.0.1",
+                port=bound,
+            )
+    assert led.state.get("infra", {}).get("runtimes", []) == []
+
+
+def test_boot_runtime_demands_a_port_placeholder(tmp_path):
+    led = Ledger.create(tmp_path / "L", "serve e2e", ["serve the page"])
+    with pytest.raises(UsageError, match=r"\{port\}"):
+        led.boot_runtime("e2e-sandbox", "python3 -m http.server 8080")
+
+
+def test_boot_runtime_times_out_when_nothing_listens_and_cleans_up(tmp_path):
+    led = Ledger.create(tmp_path / "L", "serve e2e", ["serve the page"])
+    with pytest.raises(Blocked, match="did not accept connections"):
+        led.boot_runtime(
+            "e2e-sandbox",
+            "sleep 30  # would listen on {port}",
+            timeout=2,
+        )
+    assert led.state.get("infra", {}).get("runtimes", []) == [], "a failed boot must not record a runtime"
+    log = tmp_path / "L" / "runtimes" / "e2e-sandbox.log"
+    assert log.exists(), "the failure log must survive for diagnosis"
+
+
+def test_validate_infra_checks_a_running_runtime_and_ignores_a_stopped_one(tmp_path):
+    led = Ledger.create(tmp_path / "L", "serve e2e", ["serve the page"])
+    led.boot_runtime("e2e-sandbox", "python3 -m http.server {port} --bind 127.0.0.1")
+    result = led.validate_infra()
+    runtime_checks = [c for c in result["checks"] if c["type"] == "runtime"]
+    assert runtime_checks and runtime_checks[0]["ok"]
+    led.stop_runtime("e2e-sandbox")
+    result = led.validate_infra()
+    assert result["ready"], "a stopped runtime is not a missing prerequisite"
+    assert not [c for c in result["checks"] if c["type"] == "runtime"]

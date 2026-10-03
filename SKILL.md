@@ -577,6 +577,51 @@ $CONVERGENCE record-evidence "$LEDGER" \
 This eliminates the redaction round-trip that previously blocked autonomous
 verification. The secret name is recorded; the value is not.
 
+## Boot a local runtime instead of parking it
+
+The most common fake block in generated-project runs: "the sandbox is not startable".
+A server the criteria need is not missing information — it is work. `boot-runtime`
+does the work and records it:
+
+```bash
+$CONVERGENCE boot-runtime "$LEDGER" \
+  --name e2e-sandbox \
+  --command "npx next dev -p {port}" \
+  --cwd .flow-sandbox/run-convergence-e2e \
+  --timeout 60 \
+  --resolve-signature sandbox-e2e-unavailable \
+  --criterion "C2: Signup→login→logout e2e; sessione cookie sopravvive al reload"
+```
+
+It picks a free port (substituting `{port}` into the command; pass `--port` to pin
+one), polls until something accepts connections, then records the runtime, releases
+the parked block named by `--resolve-signature`, and records `executed_here` listener
+evidence for `--criterion`. The server keeps running so the e2e criteria can be
+verified against it. Diagnostics land in `runtimes/<name>.log` inside the ledger;
+if the process dies or times out the gate refuses with the log tail.
+
+Retire it when the run no longer needs it:
+
+```bash
+$CONVERGENCE stop-runtime "$LEDGER" --name e2e-sandbox
+```
+
+`validate-infra` checks booted runtimes: a runtime that should be listening but is
+not is a missing prerequisite; a stopped one is not.
+
+## Work is not a fact: the anti-park guard
+
+Before classifying `information_missing`, read your own smallest input. If it names
+imperative verbs plus local tools or project files — "fix sandbox-server.ts port
+binding", "sync generated files and start next dev on a free port" — that is work
+this session can do, and the ledger **refuses the park**. Do the work
+(`boot-runtime`, `provision-env`, `inject-build-context`), then `resolve-block`.
+
+A legitimate park names an actor outside the session: "the operator running
+`vault login`", "a billing account with remaining quota", "a permission we do not
+hold". When such an actor is genuinely the only route, say so with `--only-route`
+and the block is disclosed in the report instead of refused.
+
 ## Preflight: validate infrastructure before starting a run
 
 Before resuming or starting a run, verify that all infrastructure prerequisites are
@@ -593,6 +638,7 @@ The command checks four categories:
 | `provision` | environment variables from `provision-env` are set |
 | `injection` | artifacts from `inject-build-context` exist at target path |
 | `secret` | retrieval commands from `store-secret` execute successfully |
+| `runtime` | runtimes from `boot-runtime` still accept connections |
 | `tool` | external binaries referenced in loops/evidence are in PATH |
 
 Exit code `0` means all checks passed; exit code `3` means at least one prerequisite
