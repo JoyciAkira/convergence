@@ -142,6 +142,13 @@ LOGS = {
     "evidence": "evidence.jsonl",
 }
 
+#: Infrastructure capabilities that turn parked paths into executable work.
+#: These are not loopholes — they are the mechanical arms that let the ledger act on
+#: the world instead of waiting for a human to paste values, copy node_modules, or
+#: provision a database by hand. Each one records its action in the ledger so the
+#: audit trail survives.
+INFRA_COMMANDS = ("provision-env", "inject-build-context", "store-secret")
+
 #: The magnet has two poles and one question: was the outcome reached? Everything else is
 #: a reason it was not, not a lesser kind of success. A run that ends any other way is
 #: still going, and `next-action` says what it is waiting on.
@@ -430,6 +437,40 @@ def _ev_risk(s, ev):
     s["risks"].append({"text": ev["text"], "blocking": ev.get("blocking", False), "at": ev["at"]})
 
 
+def _ev_provision_env(s, ev):
+    s.setdefault("infra", {}).setdefault("provisions", []).append(
+        {
+            "spec": ev["spec"],
+            "output_var": ev["output_var"],
+            "command": ev["command"],
+            "resolved": ev.get("resolved", False),
+            "at": ev["at"],
+        }
+    )
+
+
+def _ev_inject_build_context(s, ev):
+    s.setdefault("infra", {}).setdefault("injections", []).append(
+        {
+            "target": ev["target"],
+            "source": ev["source"],
+            "artifacts": ev.get("artifacts") or [],
+            "command": ev["command"],
+            "at": ev["at"],
+        }
+    )
+
+
+def _ev_store_secret(s, ev):
+    s.setdefault("infra", {}).setdefault("secrets", []).append(
+        {
+            "name": ev["name"],
+            "command": ev["command"],
+            "stored_at": ev["at"],
+        }
+    )
+
+
 _HANDLERS = {
     "init": _ev_init,
     "loop_declare": _ev_loop_declare,
@@ -448,6 +489,9 @@ _HANDLERS = {
     "decide": _ev_decide,
     "evidence": _ev_evidence,
     "risk": _ev_risk,
+    "provision_env": _ev_provision_env,
+    "inject_build_context": _ev_inject_build_context,
+    "store_secret": _ev_store_secret,
 }
 
 
@@ -1039,6 +1083,270 @@ class Ledger:
         )
         return self
 
+    # -- infrastructure ----------------------------------------------------- #
+
+    @transactional
+    def provision_env(self, spec, output_var, command):
+        """Record that an environment dependency was provisioned on-demand.
+
+        This turns an `information_missing` block into a resolved fact: the ledger
+        now knows the value exists and how it was obtained, so criteria that depend
+        on it can proceed to evidence collection without human paste.
+        """
+        spec = req(spec, "--spec")
+        output_var = req(output_var, "--output-var")
+        command = req(command, "--command")
+        self._append(
+            "control",
+            {
+                "ev": "provision_env",
+                "spec": spec,
+                "output_var": output_var,
+                "command": command,
+                "resolved": True,
+            },
+        )
+        return self
+
+    @transactional
+    def inject_build_context(self, target, source, artifacts, command):
+        """Record that build context was copied into an isolated test directory.
+
+        Without this, typechecks and builds on generated code produce false negatives
+        because dependencies live only in the host project. The injection is recorded
+        so the evidence tier can reference it and the report can disclose it.
+        """
+        target = req(target, "--target")
+        source = req(source, "--source")
+        command = req(command, "--command")
+        artifacts = [str(a).strip() for a in (artifacts or []) if str(a).strip()]
+        if not artifacts:
+            raise UsageError(
+                "--artifacts must list at least one injected item (node_modules, tsconfig.json, etc.)"
+            )
+        self._append(
+            "control",
+            {
+                "ev": "inject_build_context",
+                "target": target,
+                "source": source,
+                "artifacts": artifacts,
+                "command": command,
+            },
+        )
+        return self
+
+    @transactional
+    def store_secret(self, name, command):
+        """Record that a secret was stored securely for criterion verification.
+
+        The actual value never touches the ledger or the transcript. Only the name
+        and the retrieval command are recorded, so evidence commands can reference
+        the secret without leaking it. This eliminates the redaction round-trip
+        that previously blocked autonomous verification.
+        """
+        name = req(name, "--name")
+        command = req(command, "--command")
+        self._append(
+            "control",
+            {"ev": "store_secret", "name": name, "command": command},
+        )
+        return self
+
+    # -- preflight ---------------------------------------------------------- #
+
+    def validate_infra(self, fix=False):
+        """Check that all infrastructure prerequisites are available before
+        starting or resuming a run.
+
+        Returns a dict with `ready` (bool), `checks` (list of per-item results),
+        and `summary` (human-readable). When `fix=True`, attempts to restore
+        missing prerequisites by re-running the recorded provision/injection
+        commands. Fixes are best-effort and recorded in the check detail.
+        Exit code 0 means all checks passed; exit code 3 means at least one
+        prerequisite is missing and could not be restored.
+        """
+        import os
+        import subprocess
+        import shutil
+
+        infra = self.state.get("infra", {})
+        checks = []
+
+        # Check provisioned environments: verify the output var is set
+        for prov in infra.get("provisions", []):
+            var = prov["output_var"]
+            spec = prov["spec"]
+            cmd = f"printenv {var}"
+            try:
+                result = subprocess.run(
+                    cmd, shell=True, capture_output=True, text=True, timeout=10
+                )
+                ok = result.returncode == 0 and result.stdout.strip() != ""
+                checks.append({
+                    "type": "provision",
+                    "spec": spec,
+                    "var": var,
+                    "ok": ok,
+                    "detail": "set" if ok else f"{var} not in environment",
+                })
+            except Exception as exc:
+                checks.append({
+                    "type": "provision",
+                    "spec": spec,
+                    "var": var,
+                    "ok": False,
+                    "detail": str(exc),
+                })
+
+        # Check injected build contexts: verify artifacts exist at target
+        for inj in infra.get("injections", []):
+            target = inj["target"]
+            artifacts = inj.get("artifacts", [])
+            missing = []
+            for art in artifacts:
+                path = Path(target) / art
+                if not path.exists():
+                    missing.append(art)
+            ok = len(missing) == 0
+            checks.append({
+                "type": "injection",
+                "target": target,
+                "artifacts": artifacts,
+                "ok": ok,
+                "detail": "all present" if ok else f"missing: {', '.join(missing)}",
+            })
+
+        # Check stored secrets: verify the retrieval command executes
+        for sec in infra.get("secrets", []):
+            name = sec["name"]
+            cmd = sec["command"]
+            try:
+                result = subprocess.run(
+                    cmd, shell=True, capture_output=True, text=True, timeout=10
+                )
+                ok = result.returncode == 0 and result.stdout.strip() != ""
+                checks.append({
+                    "type": "secret",
+                    "name": name,
+                    "ok": ok,
+                    "detail": "retrievable" if ok else "command failed or empty",
+                })
+            except Exception as exc:
+                checks.append({
+                    "type": "secret",
+                    "name": name,
+                    "ok": False,
+                    "detail": str(exc),
+                })
+
+        # Check external tools referenced in loops and evidence commands.
+        # Commands may start with env-var assignments (VAR=val cmd) or command
+        # substitutions (START=$(date ...) cmd); skip tokens that are not bare
+        # binary names so we do not report "START=$(date" as a missing tool.
+        _SHELL_OPS = frozenset(("&&", "||", "|", ";", ">>", ">", "<", "2>&1", "&"))
+
+        def _extract_tool_name(cmd):
+            for token in cmd.split():
+                if token in _SHELL_OPS:
+                    continue
+                if any(c in token for c in "=$(){}><|;&"):
+                    continue
+                return token
+            return None
+
+        tool_names = set()
+        for loop in self.state.get("loops", {}).values():
+            name = _extract_tool_name(loop.get("command", ""))
+            if name:
+                tool_names.add(name)
+        for ev in self.state.get("evidence", []):
+            name = _extract_tool_name(ev.get("command", ""))
+            if name:
+                tool_names.add(name)
+        # Filter to only external binaries (not builtins)
+        builtins = {"echo", "cat", "ls", "grep", "test", "true", "false", "cd", "pwd"}
+        externals = tool_names - builtins
+        for tool in sorted(externals):
+            found = shutil.which(tool) is not None
+            checks.append({
+                "type": "tool",
+                "name": tool,
+                "ok": found,
+                "detail": "found" if found else "not in PATH",
+            })
+
+        # Auto-fix pass: attempt to restore failed checks using recorded commands
+        if fix:
+            for c in checks:
+                if c["ok"]:
+                    continue
+                if c["type"] == "provision":
+                    prov = next(
+                        (p for p in infra.get("provisions", []) if p["output_var"] == c["var"]),
+                        None,
+                    )
+                    if prov:
+                        try:
+                            result = subprocess.run(
+                                prov["command"], shell=True, capture_output=True,
+                                text=True, timeout=60,
+                            )
+                            if result.returncode == 0 and result.stdout.strip():
+                                # Export the var into current env for subsequent checks
+                                os.environ[c["var"]] = result.stdout.strip()
+                                c["ok"] = True
+                                c["detail"] = "restored via --fix"
+                            else:
+                                c["detail"] += f"; fix failed: {result.stderr.strip()[:120]}"
+                        except Exception as exc:
+                            c["detail"] += f"; fix error: {exc}"
+                elif c["type"] == "injection":
+                    inj = next(
+                        (i for i in infra.get("injections", []) if i["target"] == c["target"]),
+                        None,
+                    )
+                    if inj:
+                        try:
+                            result = subprocess.run(
+                                inj["command"], shell=True, capture_output=True,
+                                text=True, timeout=60,
+                            )
+                            if result.returncode == 0:
+                                # Re-check artifacts
+                                missing_after = [
+                                    a for a in inj.get("artifacts", [])
+                                    if not (Path(inj["target"]) / a).exists()
+                                ]
+                                if not missing_after:
+                                    c["ok"] = True
+                                    c["detail"] = "restored via --fix"
+                                else:
+                                    c["detail"] = f"fix ran but still missing: {', '.join(missing_after)}"
+                            else:
+                                c["detail"] += f"; fix failed: {result.stderr.strip()[:120]}"
+                        except Exception as exc:
+                            c["detail"] += f"; fix error: {exc}"
+                # secrets and tools cannot be auto-fixed reliably
+
+        ready = all(c["ok"] for c in checks) if checks else True
+        failed = [c for c in checks if not c["ok"]]
+        fixed = [c for c in checks if c.get("detail") == "restored via --fix"]
+        summary = (
+            f"{len(checks) - len(failed)}/{len(checks)} checks passed"
+            if checks
+            else "no infrastructure registered"
+        )
+        if fixed:
+            summary += f"; {len(fixed)} restored via --fix"
+        if failed:
+            summary += "; failing: " + ", ".join(
+                f"{c['type']}:{c.get('spec') or c.get('name') or c.get('target')} ({c['detail']})"
+                for c in failed
+            )
+
+        return {"ready": ready, "checks": checks, "summary": summary}
+
     # -- derivation --------------------------------------------------------- #
 
     def outcome(self):
@@ -1267,6 +1575,24 @@ class Ledger:
                 )
             return out
 
+        # Auto-gate: if infrastructure was registered but is not ready, require
+        # validate-infra before any other action. This prevents wasted cycles on
+        # runs that would immediately block on missing prerequisites.
+        infra = s.get("infra", {})
+        has_infra = any([
+            infra.get("provisions"),
+            infra.get("injections"),
+            infra.get("secrets"),
+        ])
+        if has_infra:
+            check = self.validate_infra()
+            if not check["ready"]:
+                return answer(
+                    "validate-infra",
+                    f"infrastructure prerequisites are not ready: {check['summary']}. "
+                    f"Run `validate-infra --fix` to attempt automatic restoration.",
+                )
+
         if s["directive"]:
             allowed = DIRECTIVE_REQUIRES[s["directive"]["kind"]]
             return answer(
@@ -1449,6 +1775,35 @@ def _build_parser():
     node.add_argument("--text", required=True)
     node.add_argument("--blocking", action="store_true")
 
+    node = add("provision-env", "provision an external dependency on-demand")
+    node.add_argument("--spec", required=True,
+                      help="what was provisioned (e.g. neon-db, vercel-project)")
+    node.add_argument("--output-var", required=True,
+                      help="environment variable name holding the result")
+    node.add_argument("--command", required=True,
+                      help="the command that created the resource")
+
+    node = add("inject-build-context", "copy host build deps into isolated test dir")
+    node.add_argument("--target", required=True,
+                      help="directory receiving the injected context")
+    node.add_argument("--source", required=True,
+                      help="host project directory providing the context")
+    node.add_argument("--artifacts", action="extend", nargs="+", default=[],
+                      help="items injected (node_modules, tsconfig.json, type defs)")
+    node.add_argument("--command", required=True,
+                      help="the command that performed the injection")
+
+    node = add("store-secret", "store a secret for secure criterion verification")
+    node.add_argument("--name", required=True,
+                      help="secret identifier referenced in evidence commands")
+    node.add_argument("--command", required=True,
+                      help="retrieval command (value never touches ledger or transcript)")
+
+    node = add("validate-infra", "preflight check: verify all infra prerequisites are available")
+    node.add_argument("--fix", action="store_true",
+                      help="attempt to restore missing prerequisites by re-running "
+                           "recorded provision/injection commands")
+
     add("status", "print the derived state as JSON")
     add("next-action", "print what the ledger requires next")
     add("close", "compute the final status and print the report")
@@ -1537,6 +1892,18 @@ def _dispatch(args):
         )
     elif command == "record-risk":
         ledger.record_risk(args.text, args.blocking)
+    elif command == "provision-env":
+        ledger.provision_env(args.spec, args.output_var, args.command)
+    elif command == "inject-build-context":
+        ledger.inject_build_context(
+            args.target, args.source, args.artifacts, args.command,
+        )
+    elif command == "store-secret":
+        ledger.store_secret(args.name, args.command)
+    elif command == "validate-infra":
+        result = ledger.validate_infra(fix=getattr(args, 'fix', False))
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return OK if result["ready"] else BLOCKED
     elif command == "status":
         print(json.dumps(ledger.state, indent=2, sort_keys=True, default=str))
         return OK

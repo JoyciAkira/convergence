@@ -506,6 +506,131 @@ Read this as a list of arguments you cannot win. Each is a test.
 - Treating `BLOCKED` as a verdict on the work. It is a verdict on the information.
 - Starting over. The ledger holds what you already refuted; resume from it.
 
+# Infrastructure — turning parked paths into executable work
+
+The ledger knows how to park a path when a fact is missing. These three commands are
+the mechanical arms that let it *resolve* the missing fact without waiting for a human
+to paste values, copy `node_modules`, or provision a database by hand. Each one records
+its action in the ledger so the audit trail survives.
+
+## Provision an external dependency on-demand
+
+When a criterion requires a service that does not yet exist (a database, a Vercel
+project, an OAuth app), provision it and record the result:
+
+```bash
+$CONVERGENCE provision-env "$LEDGER" \
+  --spec neon-db \
+  --output-var DATABASE_URL \
+  --command "neonctl project create --name parity-test --json"
+```
+
+This turns an `information_missing` block into a resolved fact. The ledger now knows
+the value exists and how it was obtained, so criteria that depend on it can proceed
+to evidence collection. Pair with `resolve-block` to release the parked path:
+
+```bash
+$CONVERGENCE resolve-block "$LEDGER" \
+  --signature needs-database \
+  --provided "provision-env created neon-db; DATABASE_URL now in environment"
+```
+
+## Inject build context into isolated test directories
+
+Generated code tested in `/tmp` produces false negatives because dependencies live
+only in the host project. Inject the necessary artifacts before running typechecks
+or builds:
+
+```bash
+$CONVERGENCE inject-build-context "$LEDGER" \
+  --target /tmp/f1-check \
+  --source apps/web \
+  --artifacts node_modules tsconfig.json src/types \
+  --command "cp -r apps/web/node_modules /tmp/f1-check/ && cp apps/web/tsconfig.json /tmp/f1-check/"
+```
+
+The injection is recorded so the evidence tier can reference it and the report can
+disclose it. Without this gate, F1/F2 criteria fail with TS7026/TS2307 errors that
+reflect missing context, not bad output.
+
+## Store secrets for secure criterion verification
+
+API keys and tokens must never touch the ledger or the transcript. Store them once
+and reference by name in evidence commands:
+
+```bash
+$CONVERGENCE store-secret "$LEDGER" \
+  --name LLM_API_KEY \
+  --command "echo \$LLM_API_KEY"
+```
+
+Evidence commands then retrieve the secret at runtime without exposing it:
+
+```bash
+$CONVERGENCE record-evidence "$LEDGER" \
+  --criterion "SSE streaming works" \
+  --command "curl -H 'Authorization: Bearer $(echo $LLM_API_KEY)' http://localhost:3000/api/chat" \
+  --tier executed_here \
+  --expected-source literal
+```
+
+This eliminates the redaction round-trip that previously blocked autonomous
+verification. The secret name is recorded; the value is not.
+
+## Preflight: validate infrastructure before starting a run
+
+Before resuming or starting a run, verify that all infrastructure prerequisites are
+available. This prevents wasted cycles on runs that will immediately block:
+
+```bash
+$CONVERGENCE validate-infra "$LEDGER"
+```
+
+The command checks four categories:
+
+| check | what it verifies |
+|---|---|
+| `provision` | environment variables from `provision-env` are set |
+| `injection` | artifacts from `inject-build-context` exist at target path |
+| `secret` | retrieval commands from `store-secret` execute successfully |
+| `tool` | external binaries referenced in loops/evidence are in PATH |
+
+Exit code `0` means all checks passed; exit code `3` means at least one prerequisite
+is missing and the run would block. The output is JSON with per-item details so agents
+can programmatically decide whether to proceed or park.
+
+### Auto-fix mode
+
+Pass `--fix` to attempt automatic restoration of missing prerequisites by re-running
+the recorded provision and injection commands:
+
+```bash
+$CONVERGENCE validate-infra "$LEDGER" --fix
+```
+
+Fixes are best-effort: provisions are re-executed and their output vars exported into
+the current environment; injections are re-run and artifacts re-checked. Secrets and
+missing tools cannot be auto-fixed and will still fail. The check detail reports
+`restored via --fix` for each successfully recovered item.
+
+### Automatic gate on `next-action`
+
+When infrastructure has been registered (via `provision-env`, `inject-build-context`,
+or `store-secret`), `next-action` automatically runs a preflight check before
+returning the next step. If any prerequisite is missing, it returns
+`validate-infra` as the required action instead of the normal next step. This
+prevents wasted cycles on runs that would immediately block:
+
+```bash
+$CONVERGENCE next-action "$LEDGER"
+# → {"required": "validate-infra", "because": "infrastructure prerequisites are not ready: ..."}
+```
+
+Run `validate-infra --fix` to restore what can be restored, then call `next-action`
+again to resume normal operation.
+
+---
+
 ## Composing with the rest of the library
 
 This skill does not replace them, and it is not a substitute for the planning front end.
