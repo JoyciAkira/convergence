@@ -276,6 +276,52 @@ def _kill_process(pid):
     except (ProcessLookupError, PermissionError):
         pass
 
+
+def _listener_pids(port):
+    """PIDs with a LISTEN socket on port, via lsof. Dev servers like `next dev`
+    may respawn their actual server in a fresh process group, so the recorded
+    pid's group is not always the group holding the port."""
+    import os
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return sorted({
+        int(line) for line in out.split() if line.strip().isdigit()
+    })
+
+
+def _retire_port(port, attempts=5):
+    """Kill every process still listening on port until the port is clear.
+    Returns True when nothing listens on the port anymore."""
+    import os
+    import signal
+
+    for _ in range(attempts):
+        pids = _listener_pids(port)
+        if not pids:
+            return True
+        for pid in pids:
+            try:
+                pgid = os.getpgid(pid)
+            except (ProcessLookupError, PermissionError):
+                pgid = None
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    if pgid is not None:
+                        os.killpg(pgid, sig)
+                    else:
+                        os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        time.sleep(0.5)
+    return not _listener_pids(port)
+
 #: The right edge is the criteria list. It is set once and moves only through a disputed,
 #: recorded fork — never by editing, and never silently.
 
@@ -1364,6 +1410,7 @@ class Ledger:
                 time.sleep(0.25)
             else:
                 _kill_process(proc.pid)
+                _retire_port(port)
                 raise Blocked(
                     f"runtime {name!r} did not accept connections on port {port} "
                     f"within {timeout:g}s. Tail of {log_path}: {_tail(log_path)}"
@@ -1415,7 +1462,16 @@ class Ledger:
                 f"no running runtime named {name!r} in this ledger; "
                 f"running: {running or 'none'}"
             )
+        port = target.get("port")
         _kill_process(target["pid"])
+        # The recorded pid's group is not guaranteed to still own the port
+        # (dev servers respawn their server child in a new group), so verify
+        # the port is actually clear and reap stragglers if not.
+        if port is not None and not _retire_port(port):
+            raise Blocked(
+                f"runtime {name!r}: port {port} is still bound by processes "
+                f"{_listener_pids(port)} that could not be stopped"
+            )
         self._append("control", {"ev": "stop_runtime", "name": name})
         return self
 

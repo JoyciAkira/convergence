@@ -1078,6 +1078,52 @@ def test_boot_runtime_picks_a_free_port_and_stop_runtime_retires_it(tmp_path):
     assert not _port_open(rt["port"]), "stop-runtime must actually kill the server"
 
 
+def test_stop_runtime_reaps_a_listener_that_respawned_in_a_new_group(tmp_path):
+    """next dev may respawn its server child in a fresh process group; the
+    recorded pid's killpg then misses it and the port stays bound. stop-runtime
+    must notice and reap whatever still listens."""
+    import textwrap
+    import time
+
+    detached = textwrap.dedent(
+        """
+        import socket, sys, time
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", int(sys.argv[1])))
+        srv.listen(5)
+        open(sys.argv[2], "w").write("ready")
+        while True:
+            time.sleep(1)
+        """
+    )
+    script = tmp_path / "detached_server.py"
+    marker = tmp_path / "ready"
+    script.write_text(detached)
+    # Parent (the "npx" role) spawns the real server detached, then idles.
+    cmd = (
+        "python3 -c \"import subprocess,sys,time;"
+        f"subprocess.Popen([sys.executable,{str(script)!r},'{{port}}',"
+        f"{str(marker)!r}],start_new_session=True);time.sleep(60)\""
+    )
+    led = Ledger.create(tmp_path / "L", "serve e2e", ["serve the page"])
+    led.boot_runtime("respawner", cmd, timeout=15)
+    for _ in range(50):
+        if marker.exists():
+            break
+        time.sleep(0.1)
+    assert marker.exists(), "the detached listener never came up"
+    rt = led.state["infra"]["runtimes"][0]
+    led.stop_runtime("respawner")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and _port_open(rt["port"]):
+        time.sleep(0.2)
+    assert not _port_open(rt["port"]), (
+        "stop-runtime must free the port even when the server lives in another "
+        "process group"
+    )
+
+
 def test_boot_runtime_releases_a_parked_block_and_records_listener_evidence(tmp_path):
     led = Ledger.create(tmp_path / "L", "serve e2e", ["serve the page"])
     led.classify("sandbox-e2e-unavailable", "information_missing",
