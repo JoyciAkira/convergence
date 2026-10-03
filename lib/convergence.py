@@ -1710,10 +1710,15 @@ class Ledger:
             if c["kind"] == "information_missing" and c["signature"] not in resolved
         ]
         blocking_risks = [r["text"] for r in s["risks"] if r["blocking"]]
-        covered = {e["criterion"] for e in s["evidence"] if e["tier"] != "unavailable"}
+        # A criterion's tier is its LATEST evidence: work discharged after a
+        # park passes, and a retraction after work marks it unavailable again.
+        latest_tier = {}
+        for e in s["evidence"]:
+            latest_tier[e["criterion"]] = e["tier"]
+        covered = {c for c, t in latest_tier.items() if t != "unavailable"}
         unavailable_only = sorted(
             c for c in s["criteria"]
-            if c not in covered and any(e["criterion"] == c for e in s["evidence"])
+            if c not in covered and latest_tier.get(c) == "unavailable"
         )
         uncovered = [
             c for c in s["criteria"]
@@ -1789,10 +1794,13 @@ class Ledger:
     def report(self):
         s = self.state
         status, blocking, disclosed = self.outcome()
-        covered = {e["criterion"] for e in s["evidence"] if e["tier"] != "unavailable"}
-        unavailable = {
-            e["criterion"] for e in s["evidence"] if e["tier"] == "unavailable"
-        }
+        # A criterion's tier is its LATEST evidence: a park later discharged
+        # with executed_here work is passed, not permanently unavailable.
+        latest_tier = {}
+        for e in s["evidence"]:
+            latest_tier[e["criterion"]] = e["tier"]
+        covered = {c for c, t in latest_tier.items() if t != "unavailable"}
+        unavailable = {c for c, t in latest_tier.items() if t == "unavailable"}
 
         lines = ["# Convergence report", ""]
         lines += ["## Intent", "", s["intent"] or "_(not initialised)_", ""]

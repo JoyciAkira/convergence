@@ -630,6 +630,34 @@ def test_close_writes_the_report_and_fails_loudly_when_unearned(tmp_path):
     assert (path / "report.md").exists()
 
 
+def test_work_after_a_park_passes_and_later_unavailable_fails(tmp_path):
+    """A criterion's verdict follows its LATEST evidence: an early park
+    discharged with executed_here work passes, and work retracted back to
+    unavailable must block the close again."""
+    path = tmp_path / "L"
+    run_cli("init", str(path), "--intent", "ship it", "--criterion", "e2e passes")
+    run_cli("record-evidence", str(path), "--criterion", "e2e passes",
+            "--command", "find .", "--tier", "unavailable",
+            "--reason", "sandbox not startable")
+    run_cli("record-evidence", str(path), "--criterion", "e2e passes",
+            "--command", "playwright test", "--tier", "executed_here")
+    led = Ledger(path)
+    assert led.outcome()[0] == "REACHED"
+    report = led.report()
+    passed = report.split("**Passed**")[1].split("**Failed**")[0]
+    unavailable = report.split("**Unavailable**")[1]
+    assert "e2e passes" in passed, "work after a park must appear under Passed"
+    assert "e2e passes" not in unavailable
+
+    run_cli("record-evidence", str(path), "--criterion", "e2e passes",
+            "--command", "sandbox gone", "--tier", "unavailable",
+            "--reason", "sandbox gone")
+    led = Ledger(path)
+    assert led.outcome()[0] == "NOT REACHED", (
+        "a retraction after work must block the close again"
+    )
+
+
 def test_a_full_run_closes_zero_through_the_cli(tmp_path):
     path = tmp_path / "L"
     run_cli("init", str(path), "--intent", "ship it", "--criterion", "works")
