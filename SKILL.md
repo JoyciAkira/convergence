@@ -504,6 +504,8 @@ Read this as a list of arguments you cannot win. Each is a test.
 - Padding the hypothesis ledger with restatements to reach three.
 - `close`-ing to find out what was missing, then fixing the ledger instead of the work.
 - Treating `BLOCKED` as a verdict on the work. It is a verdict on the information.
+- Trusting a tool's success message without re-observing the effect: "stopped"
+  with the port still bound, "deleted" with the file still there. Verify, then claim.
 - Starting over. The ledger holds what you already refuted; resume from it.
 
 # Infrastructure — turning parked paths into executable work
@@ -600,11 +602,30 @@ evidence for `--criterion`. The server keeps running so the e2e criteria can be
 verified against it. Diagnostics land in `runtimes/<name>.log` inside the ledger;
 if the process dies or times out the gate refuses with the log tail.
 
+**"Port already in use" is never a decision point.** Unpinned, `boot-runtime` asks
+the kernel for a free port, so the case cannot arise. If you pin a port and it is
+occupied — an orphaned dev server from a previous run, a neighbour's sandbox — that
+is local work, not missing information: find the listener
+(`lsof -nP -iTCP:<port> -sTCP:LISTEN`), stop it, boot again. The fact you would be
+parking on does not exist outside your reach; it is sitting in your own process
+table. Classifying that as `information_missing` is the anti-park refusal doing its
+job.
+
 Retire it when the run no longer needs it:
 
 ```bash
 $CONVERGENCE stop-runtime "$LEDGER" --name e2e-sandbox
 ```
+
+**Stop is honest or it is nothing.** A dev server may respawn its actual listener
+in a fresh process group, so killing the recorded pid can leave the port bound
+while the command reports success — and a lying stop poisons every later boot on
+that port. `stop-runtime` therefore verifies the *effect*, not the intention: it
+re-checks the port with `lsof`, reaps any respawned listener (SIGTERM then
+SIGKILL, by group or by pid), and **Blocks** naming the surviving pids if it
+cannot free the port. The general rule generalises past this command: a success
+report is a claim until its effect is re-observed. When a tool says "stopped",
+re-check the port before you believe it.
 
 `validate-infra` checks booted runtimes: a runtime that should be listening but is
 not is a missing prerequisite; a stopped one is not.
