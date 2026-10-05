@@ -28,6 +28,11 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from runtime import FakeRuntimeManager, RealOSRuntimeManager, RuntimeManager
+from events import HANDLERS, apply_event
+from derivation import next_action as derive_next_action, outcome as derive_outcome, report as derive_report
+from exceptions import Blocked, UsageError
+from comparator import ClaimComparator, JaccardComparator
 
 LEDGER_VERSION = 2
 
@@ -326,14 +331,6 @@ def _retire_port(port, attempts=5):
 #: recorded fork — never by editing, and never silently.
 
 
-class Blocked(Exception):
-    """A gate refused the action. Exit code 3."""
-
-
-class UsageError(Exception):
-    """Malformed input. Exit code 2."""
-
-
 # --------------------------------------------------------------------------- #
 # input validation
 # --------------------------------------------------------------------------- #
@@ -386,292 +383,6 @@ def empty_state():
     }
 
 
-def apply_event(state, ev):
-    """Fold one event into `state` in place. Unknown events are a corrupt log."""
-    kind = ev.get("ev")
-    handler = _HANDLERS.get(kind)
-    if handler is None:
-        raise UsageError(f"corrupt ledger: unknown event {kind!r}")
-    handler(state, ev)
-    state["events"] += 1
-
-
-def _ev_init(s, ev):
-    s["intent"] = ev["intent"]
-    s["criteria"] = list(ev.get("criteria") or [])
-
-
-def _ev_loop_declare(s, ev):
-    s["loops"][ev["incident"]] = {
-        "command": ev["command"],
-        "symptom": ev["symptom"],
-        "ran": False,
-        "red": False,
-        "declared_at": ev["at"],
-    }
-
-
-def _ev_loop_run(s, ev):
-    loop = s["loops"].get(ev["incident"])
-    if loop is None:
-        raise UsageError(f"no loop declared for incident {ev['incident']!r}")
-    loop["ran"] = True
-    loop["red"] = ev["red"]
-    loop["ran_at"] = ev["at"]
-
-
-def _ev_hyp_open(s, ev):
-    s["hypotheses"][ev["id"]] = {
-        "id": ev["id"],
-        "incident": ev["incident"],
-        "claim": ev["claim"],
-        "prediction": ev["prediction"],
-        "rank": ev.get("rank"),
-        "status": "open",
-        "probe": None,
-        "observed": None,
-        "opened_at": ev["at"],
-        "closed_at": None,
-    }
-
-
-def _ev_hyp_refute(s, ev):
-    _close_hypothesis(s, ev, "refuted")
-
-
-def _ev_hyp_survive(s, ev):
-    _close_hypothesis(s, ev, "surviving")
-
-
-def _close_hypothesis(s, ev, status):
-    hyp = s["hypotheses"].get(ev["id"])
-    if hyp is None:
-        raise UsageError(f"unknown hypothesis {ev['id']!r}")
-    if hyp["status"] != "open":
-        raise Blocked(f"hypothesis {ev['id']!r} is already {hyp['status']}")
-    hyp["status"] = status
-    hyp["probe"] = ev["probe"]
-    hyp["observed"] = ev["observed"]
-    hyp["closed_at"] = ev["at"]
-
-
-def _ev_hyp_merge(s, ev):
-    target = s["hypotheses"].get(ev["into"])
-    source = s["hypotheses"].get(ev["from"])
-    if target is None or source is None:
-        raise UsageError("merge needs an existing --into and --from hypothesis")
-    if target["status"] == "merged":
-        raise Blocked(f"cannot merge into {ev['into']!r}: it was itself merged elsewhere")
-    if source["status"] == "merged":
-        raise Blocked(f"cannot merge {ev['from']!r}: it was already merged into {source['merged_into']!r}")
-    if source["id"] == target["id"]:
-        raise Blocked(f"cannot merge {ev['from']!r} into itself")
-    if source["claim"].strip().lower() == target["claim"].strip().lower():
-        raise Blocked(
-            f"merge is a no-op: {ev['from']!r} and {ev['into']!r} state the same claim"
-        )
-    target["merged_from"] = target.get("merged_from", []) + [ev["from"]]
-    target["merge_note"] = ev["note"]
-    source["status"] = "merged"
-    source["merged_into"] = ev["into"]
-    source["closed_at"] = ev["at"]
-
-
-def _ev_fix_begin(s, ev):
-    s["fixes"][ev["incident"]] = {
-        "note": ev["note"], "search": ev.get("search", "full"), "at": ev["at"],
-    }
-
-
-def _ev_classify(s, ev):
-    s["classifications"].append(
-        {
-            "signature": ev["signature"],
-            "kind": ev["kind"],
-            "missing_fact": ev.get("missing_fact"),
-            "smallest_input": ev.get("smallest_input"),
-            "tried": ev.get("tried") or [],
-            "park": ev.get("park"),
-            "only_route": ev.get("only_route"),
-            "note": ev.get("note"),
-            "at": ev["at"],
-        }
-    )
-    if ev["kind"] == "information_missing":
-        s["directive"] = None
-    else:
-        s["directive"] = {"kind": ev["kind"], "set_at": ev["at"]}
-
-
-def _ev_directive_clear(s, ev):
-    s["directive"] = None
-
-
-def _ev_resolve_block(s, ev):
-    s["resolved_blocks"].append(
-        {"signature": ev["signature"], "input": ev["input"], "at": ev["at"]}
-    )
-
-
-def _ev_fork_open(s, ev):
-    s["forks"][ev["id"]] = {
-        "id": ev["id"],
-        "question": ev["question"],
-        "trigger": ev["trigger"],
-        "assumed": ev["assumed"],
-        "options": ev["options"],
-        "invalidation_rationale": ev.get("invalidation_rationale"),
-        "criterion_from": ev.get("criterion_from"),
-        "criterion_to": ev.get("criterion_to"),
-        "opened_at": ev["at"],
-    }
-
-
-def _ev_criterion_revised(s, ev):
-    """Move the right edge. Only ever reached through a disputed, decided fork."""
-    s["criteria"] = [c for c in s["criteria"] if c != ev["from"]]
-    s["criteria"].append(ev["to"])
-    s["criterion_revisions"].append(
-        {
-            "from": ev["from"],
-            "to": ev["to"],
-            "fork": ev["fork"],
-            "invalidated": ev.get("invalidated") or [],
-            "at": ev["at"],
-        }
-    )
-
-
-def _ev_dispute(s, ev):
-    s["disputes"].append(
-        {
-            "fork": ev["fork"],
-            "challenger": ev["challenger"],
-            "author": ev["author"],
-            "steelman": ev["steelman"],
-            "verdict": ev.get("verdict"),
-            "at": ev["at"],
-        }
-    )
-
-
-def _ev_decide(s, ev):
-    s["decisions"][ev["fork"]] = {
-        "chosen": ev["chosen"],
-        "by": ev["by"],
-        "human_ack": ev.get("human_ack", False),
-        "reversibility": ev["reversibility"],
-        "anchors": ev.get("anchors") or [],
-        "invalidated": ev.get("invalidated") or [],
-        "rationale": ev.get("rationale"),
-        "challenger_overruled": ev.get("challenger_overruled", False),
-        "override_reason": ev.get("override_reason"),
-        "at": ev["at"],
-    }
-
-
-def _ev_evidence(s, ev):
-    s["evidence"].append(
-        {
-            "criterion": ev["criterion"],
-            "command": ev["command"],
-            "tier": ev["tier"],
-            "reproduced_by": ev.get("reproduced_by"),
-            "expected_source": ev.get("expected_source"),
-            "reason": ev.get("reason"),
-            "output_ref": ev.get("output_ref"),
-            "at": ev["at"],
-        }
-    )
-
-
-def _ev_risk(s, ev):
-    s["risks"].append({"text": ev["text"], "blocking": ev.get("blocking", False), "at": ev["at"]})
-
-
-def _ev_provision_env(s, ev):
-    s.setdefault("infra", {}).setdefault("provisions", []).append(
-        {
-            "spec": ev["spec"],
-            "output_var": ev["output_var"],
-            "command": ev["command"],
-            "resolved": ev.get("resolved", False),
-            "at": ev["at"],
-        }
-    )
-
-
-def _ev_inject_build_context(s, ev):
-    s.setdefault("infra", {}).setdefault("injections", []).append(
-        {
-            "target": ev["target"],
-            "source": ev["source"],
-            "artifacts": ev.get("artifacts") or [],
-            "command": ev["command"],
-            "at": ev["at"],
-        }
-    )
-
-
-def _ev_store_secret(s, ev):
-    s.setdefault("infra", {}).setdefault("secrets", []).append(
-        {
-            "name": ev["name"],
-            "command": ev["command"],
-            "stored_at": ev["at"],
-        }
-    )
-
-
-def _ev_boot_runtime(s, ev):
-    s.setdefault("infra", {}).setdefault("runtimes", []).append(
-        {
-            "name": ev["name"],
-            "command": ev["command"],
-            "port": ev["port"],
-            "url": ev["url"],
-            "pid": ev["pid"],
-            "log": ev["log"],
-            "stopped": False,
-            "booted_at": ev["at"],
-        }
-    )
-
-
-def _ev_stop_runtime(s, ev):
-    runtimes = s.setdefault("infra", {}).setdefault("runtimes", [])
-    for rt in runtimes:
-        if rt["name"] == ev["name"] and not rt.get("stopped"):
-            rt["stopped"] = True
-            rt["stopped_at"] = ev["at"]
-            return
-    raise Blocked(f"no running runtime named {ev['name']!r}")
-
-
-_HANDLERS = {
-    "init": _ev_init,
-    "loop_declare": _ev_loop_declare,
-    "loop_run": _ev_loop_run,
-    "hyp_open": _ev_hyp_open,
-    "hyp_refute": _ev_hyp_refute,
-    "hyp_survive": _ev_hyp_survive,
-    "hyp_merge": _ev_hyp_merge,
-    "fix_begin": _ev_fix_begin,
-    "classify": _ev_classify,
-    "directive_clear": _ev_directive_clear,
-    "resolve_block": _ev_resolve_block,
-    "fork_open": _ev_fork_open,
-    "criterion_revised": _ev_criterion_revised,
-    "dispute": _ev_dispute,
-    "decide": _ev_decide,
-    "evidence": _ev_evidence,
-    "risk": _ev_risk,
-    "provision_env": _ev_provision_env,
-    "inject_build_context": _ev_inject_build_context,
-    "store_secret": _ev_store_secret,
-    "boot_runtime": _ev_boot_runtime,
-    "stop_runtime": _ev_stop_runtime,
-}
 
 
 # --------------------------------------------------------------------------- #
@@ -680,9 +391,11 @@ _HANDLERS = {
 
 
 class Ledger:
-    def __init__(self, root):
+    def __init__(self, root, runtime_manager: RuntimeManager | None = None, claim_comparator: ClaimComparator | None = None):
         self.root = Path(root)
         self.state = empty_state()
+        self.runtime_manager = runtime_manager or RealOSRuntimeManager()
+        self.claim_comparator = claim_comparator or JaccardComparator()
         if not self.root.exists():
             raise UsageError(f"ledger directory does not exist: {self.root}")
         self._replay_all()
@@ -855,7 +568,7 @@ class Ledger:
                     f"hypothesis already recorded: {existing['id']!r} states the same claim. "
                     f"Padding the ledger with restatements defeats the search."
                 )
-            overlap = _overlap(existing["claim"], claim)
+            overlap = self.claim_comparator.similarity(existing["claim"], claim)
             if overlap >= CLAIM_OVERLAP_THRESHOLD:
                 shared = sorted(_claim_words(existing["claim"]) & _claim_words(claim))
                 raise Blocked(
@@ -1357,8 +1070,6 @@ class Ledger:
         listener evidence. The server keeps running after this returns so e2e
         criteria can be verified against it; `stop-runtime` retires it.
         """
-        import subprocess
-
         name = req(name, "--name")
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", name)
         command = req(command, "--command")
@@ -1375,46 +1086,28 @@ class Ledger:
             port = int(port)
             if not 0 < port < 65536:
                 raise UsageError(f"--port must be between 1 and 65535, got {port}")
-            if _port_open(port):
+            if self.runtime_manager.is_port_open(port):
                 raise Blocked(
                     f"--port {port} is already in use; boot-runtime never starts a "
                     f"second server on a bound port. Omit --port to have a free "
                     f"one chosen."
                 )
         else:
-            port = _free_port()
+            port = self.runtime_manager.allocate_free_port()
         actual_command = command.replace("{port}", str(port))
 
         runtimes_dir = self.root / "runtimes"
-        runtimes_dir.mkdir(parents=True, exist_ok=True)
         log_path = runtimes_dir / f"{safe_name}.log"
-        with log_path.open("w", encoding="utf-8") as log_file:
-            proc = subprocess.Popen(
-                actual_command,
-                shell=True,
+        try:
+            handle = self.runtime_manager.start_listener(
+                command=actual_command,
+                port=port,
+                log_path=log_path,
                 cwd=str(cwd) if cwd else None,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
+                timeout=timeout,
             )
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                if _port_open(port):
-                    break
-                if proc.poll() is not None:
-                    raise Blocked(
-                        f"runtime {name!r} exited before accepting connections "
-                        f"(exit code {proc.returncode}). Tail of {log_path}: "
-                        f"{_tail(log_path)}"
-                    )
-                time.sleep(0.25)
-            else:
-                _kill_process(proc.pid)
-                _retire_port(port)
-                raise Blocked(
-                    f"runtime {name!r} did not accept connections on port {port} "
-                    f"within {timeout:g}s. Tail of {log_path}: {_tail(log_path)}"
-                )
+        except RuntimeError as exc:
+            raise Blocked(str(exc)) from exc
 
         url = f"http://127.0.0.1:{port}{path}"
         with self.transaction():
@@ -1426,15 +1119,15 @@ class Ledger:
                     "command": actual_command,
                     "port": port,
                     "url": url,
-                    "pid": proc.pid,
-                    "log": str(log_path),
+                    "pid": handle.pid,
+                    "log": str(handle.log_path),
                 },
             )
         if resolve_signature:
             self.resolve_block(
                 resolve_signature,
-                f"boot-runtime started {name!r} listening on {url} (pid {proc.pid}); "
-                f"log at {log_path}",
+                f"boot-runtime started {name!r} listening on {url} (pid {handle.pid}); "
+                f"log at {handle.log_path}",
             )
         if criterion:
             self.record_evidence(
@@ -1444,7 +1137,7 @@ class Ledger:
                 expected_source="literal",
                 reason=f"runtime {name!r} accepted connections on {url}",
             )
-        print(f"boot-runtime: {name} listening on {url} (pid {proc.pid})")
+        print(f"boot-runtime: {name} listening on {url} (pid {handle.pid})")
         return self
 
     @transactional
@@ -1463,15 +1156,11 @@ class Ledger:
                 f"running: {running or 'none'}"
             )
         port = target.get("port")
-        _kill_process(target["pid"])
-        # The recorded pid's group is not guaranteed to still own the port
-        # (dev servers respawn their server child in a new group), so verify
-        # the port is actually clear and reap stragglers if not.
-        if port is not None and not _retire_port(port):
-            raise Blocked(
-                f"runtime {name!r}: port {port} is still bound by processes "
-                f"{_listener_pids(port)} that could not be stopped"
-            )
+        handle = type("H", (), {"pid": target["pid"], "port": port})()
+        try:
+            self.runtime_manager.stop_listener(handle)
+        except RuntimeError as exc:
+            raise Blocked(str(exc)) from exc
         self._append("control", {"ev": "stop_runtime", "name": name})
         return self
 
@@ -1688,299 +1377,21 @@ class Ledger:
 
     # -- derivation --------------------------------------------------------- #
 
+    def _resolved_signatures(self):
+        """Signatures of blocks that have been resolved via input."""
+        return {b["signature"] for b in self.state.get("resolved_blocks", [])}
+
     def outcome(self):
-        """REACHED or NOT REACHED — the magnet has two poles and one question.
-
-        `blocking` is everything standing between the run and the outcome. Any of it
-        present means NOT REACHED. There is no lesser kind of success: a criterion that
-        could not be verified is unmet intent, not decoration, so it blocks.
-
-        `disclosed` is how the result was reached, recorded but not gating: dissent
-        overruled, a narrow search, an autonomously authored decision, a run that had to
-        be restarted from a non-convergence diagnosis. Those are method notes about a
-        result that *was* reached. Gating on them made a clean verdict unreachable for
-        any run that met a fork, which is backwards.
-        """
-        s = self.state
-        open_hyps = sorted(h["id"] for h in s["hypotheses"].values() if h["status"] == "open")
-        undecided = sorted(f for f in s["forks"] if f not in s["decisions"])
-        resolved = self._resolved_signatures()
-        parked = [
-            c for c in s["classifications"]
-            if c["kind"] == "information_missing" and c["signature"] not in resolved
-        ]
-        blocking_risks = [r["text"] for r in s["risks"] if r["blocking"]]
-        # A criterion's tier is its LATEST evidence: work discharged after a
-        # park passes, and a retraction after work marks it unavailable again.
-        latest_tier = {}
-        for e in s["evidence"]:
-            latest_tier[e["criterion"]] = e["tier"]
-        covered = {c for c, t in latest_tier.items() if t != "unavailable"}
-        unavailable_only = sorted(
-            c for c in s["criteria"]
-            if c not in covered and latest_tier.get(c) == "unavailable"
-        )
-        uncovered = [
-            c for c in s["criteria"]
-            if c not in covered and c not in unavailable_only
-        ]
-
-        blocking = []
-        if uncovered:
-            blocking.append(f"criteria never verified: {uncovered}")
-        if unavailable_only:
-            blocking.append(
-                f"criteria that could only be verified as unavailable: {unavailable_only}"
-            )
-        if open_hyps:
-            blocking.append(f"hypotheses still untested: {open_hyps}")
-        if undecided:
-            blocking.append(f"forks never decided: {undecided}")
-        if parked:
-            blocking.append(
-                "paths parked on facts nobody supplied: "
-                + ", ".join(
-                    f"{c['signature']}"
-                    + (f" (parked: {c['park']})" if c.get("park") else "")
-                    + f" needs {c['missing_fact']} via {c['smallest_input']}"
-                    for c in parked
-                )
-            )
-        if s["directive"] and s["directive"]["kind"] == "loop_defective":
-            blocking.append(
-                "a feedback loop was declared defective and never rebuilt; evidence gathered "
-                "through it does not count"
-            )
-        if blocking_risks:
-            blocking.append(f"blocking risks recorded: {blocking_risks}")
-
-        disclosed = []
-        if s["criterion_revisions"]:
-            disclosed.append(
-                f"the right edge was moved {len(s['criterion_revisions'])} time(s), each "
-                f"through a disputed fork: "
-                + ", ".join(f"{r['from']!r} -> {r['to']!r}" for r in s["criterion_revisions"])
-            )
-        overruled = sorted(f for f, d in s["decisions"].items() if d.get("challenger_overruled"))
-        if overruled:
-            disclosed.append(
-                f"the challenger's objection was overruled on {overruled}: "
-                f"{[s['decisions'][f].get('override_reason') for f in overruled]}"
-            )
-        narrow = sorted(k for k, v in s["fixes"].items() if v.get("search") == "narrow")
-        if narrow:
-            disclosed.append(
-                f"fixes chosen with --search narrow, i.e. without searching over rival "
-                f"explanations: {narrow}"
-            )
-        nonterminal = sorted({
-            c["signature"] for c in s["classifications"] if c["kind"] != "information_missing"
-        })
-        solo_route = [c for c in s["classifications"] if c.get("only_route")]
-        if solo_route:
-            disclosed.append(
-                "blocks taken on the word that there was no other route: "
-                + ", ".join(f"{c['signature']} ({c['only_route']})" for c in solo_route)
-            )
-        if nonterminal:
-            disclosed.append(
-                "repeated non-convergence kept this run alive past its own diagnosis: "
-                + ", ".join(nonterminal)
-            )
-        disclosed.extend(f"risk: {r['text']}" for r in s["risks"] if not r["blocking"])
-
-        return ("NOT REACHED" if blocking else "REACHED"), blocking, disclosed
+        """Delegate to pure derivation module."""
+        return derive_outcome(self.state)
 
     def report(self):
-        s = self.state
-        status, blocking, disclosed = self.outcome()
-        # A criterion's tier is its LATEST evidence: a park later discharged
-        # with executed_here work is passed, not permanently unavailable.
-        latest_tier = {}
-        for e in s["evidence"]:
-            latest_tier[e["criterion"]] = e["tier"]
-        covered = {c for c, t in latest_tier.items() if t != "unavailable"}
-        unavailable = {c for c, t in latest_tier.items() if t == "unavailable"}
-
-        lines = ["# Convergence report", ""]
-        lines += ["## Intent", "", s["intent"] or "_(not initialised)_", ""]
-
-        lines += ["## Acceptance criteria", ""]
-        if s["criteria"]:
-            lines += [f"- `{c}`" for c in s["criteria"]]
-        else:
-            lines.append("_none recorded_")
-        lines.append("")
-
-        lines += ["## Work performed", ""]
-        fix_rows = [
-            f"- `{incident}`: {fix['note']} (search: {fix.get('search', 'full')})"
-            for incident, fix in sorted(s["fixes"].items())
-        ]
-        lines += rows(fix_rows, "`control.jsonl`") if fix_rows else ["_no fix recorded_"]
-        lines.append("")
-
-        lines += ["## Verification", ""]
-        for label, criteria in (
-            ("Passed", sorted(covered - unavailable)),
-            ("Failed", []),
-            ("Not run", [c for c in s["criteria"] if c not in covered and c not in unavailable]),
-            ("Unavailable", sorted(unavailable)),
-        ):
-            lines.append(f"**{label}**")
-            lines += rows([f"- `{c}`" for c in criteria])
-            lines.append("")
-
-        lines += ["## Hypothesis ledger", ""]
-        ledger_rows = []
-        for ident in sorted(s["hypotheses"]):
-            hyp = s["hypotheses"][ident]
-            closed = f" -> {hyp['status']} by `{hyp['probe']}`" if hyp["probe"] else ""
-            ledger_rows.append(f"- `{hyp['id']}` [{hyp['status']}] {hyp['claim']}{closed}")
-        lines += rows(ledger_rows, "`hypotheses.jsonl`")
-        lines.append("")
-
-        lines += ["## Challenger findings", ""]
-        dispute_rows = [
-            f"- fork `{d['fork']}`: {d['challenger']} against {d['author']}"
-            + (f" verdict={d['verdict']}" if d.get("verdict") else "")
-            + f" — {d['steelman']}"
-            for d in s["disputes"]
-        ]
-        lines += rows(dispute_rows, "`forks.jsonl`") if dispute_rows else ["None found"]
-        lines.append("")
-
-        lines += ["## Conflicts and tradeoffs", ""]
-        fork_rows = []
-        for fork_id in sorted(s["forks"]):
-            fork = s["forks"][fork_id]
-            decision = s["decisions"].get(fork_id)
-            if not decision:
-                fork_rows.append(f"- `{fork_id}`: {fork['question']} -> UNDECIDED")
-                continue
-            fork_rows.append(
-                f"- `{fork_id}`: {fork['question']} -> chose `{decision['chosen']}` "
-                f"({decision['by']}"
-                f"{', human-acknowledged' if decision['human_ack'] else ''})"
-            )
-            if decision["invalidated"]:
-                fork_rows.append(f"  invalidated: {', '.join(decision['invalidated'])}")
-        lines += rows(fork_rows, "`forks.jsonl`") if fork_rows else ["None found"]
-        lines.append("")
-
-        lines += ["## Decay risks", ""]
-        if s["classifications"]:
-            for item in s["classifications"]:
-                mark = " (resolved)" if item["signature"] in self._resolved_signatures() else ""
-                lines.append(
-                    f"- signature `{item['signature']}` classified `{item['kind']}`{mark}"
-                )
-        else:
-            lines.append("None found")
-        lines.append("")
-
-        lines += ["## Human anchors", ""]
-        anchored = [
-            f"`{f}` touches {sorted(set(d['anchors']) & set(HUMAN_ANCHORS))}"
-            for f, d in sorted(s["decisions"].items())
-            if set(d["anchors"]) & set(HUMAN_ANCHORS)
-        ]
-        lines += anchored or ["None touched"]
-        lines.append("")
-
-        lines += ["## What still stands between the run and the outcome", ""]
-        lines += rows([f"- {r}" for r in blocking])
-        lines.append("")
-
-        lines += ["## How the outcome was reached", ""]
-        lines += rows([f"- {r}" for r in disclosed])
-        lines.append("")
-
-        lines += ["## Final status", "", f"**{status}**", ""]
-        return "\n".join(lines)
+        """Delegate to pure derivation module."""
+        return derive_report(self.state)
 
     def next_action(self):
-        """The next thing the run owes. A parked path never becomes a stopping point
-        while other work remains — that is the whole difference between a block and an
-        ending. Parked paths are reported alongside, not instead."""
-        s = self.state
-        resolved = self._resolved_signatures()
-        parked = [
-            f"{c['signature']}"
-            + (f" (parked: {c['park']})" if c.get("park") else "")
-            + f" needs {c['missing_fact']} via {c['smallest_input']}"
-            for c in s["classifications"]
-            if c["kind"] == "information_missing" and c["signature"] not in resolved
-        ]
-
-        def answer(required, because):
-            out = {"required": required, "because": because}
-            if parked:
-                out["parked_paths"] = parked
-                out["parked_note"] = (
-                    "these paths are parked, not finished; other work continues meanwhile"
-                )
-            return out
-
-        # Auto-gate: if infrastructure was registered but is not ready, require
-        # validate-infra before any other action. This prevents wasted cycles on
-        # runs that would immediately block on missing prerequisites.
-        infra = s.get("infra", {})
-        has_infra = any([
-            infra.get("provisions"),
-            infra.get("injections"),
-            infra.get("secrets"),
-        ])
-        if has_infra:
-            check = self.validate_infra()
-            if not check["ready"]:
-                return answer(
-                    "validate-infra",
-                    f"infrastructure prerequisites are not ready: {check['summary']}. "
-                    f"Run `validate-infra --fix` to attempt automatic restoration.",
-                )
-
-        if s["directive"]:
-            allowed = DIRECTIVE_REQUIRES[s["directive"]["kind"]]
-            return answer(
-                allowed[0] if allowed else "resolve_block",
-                DIRECTIVE_MESSAGE[s["directive"]["kind"]],
-            )
-
-        unsettled = sorted(
-            {h["incident"] for h in s["hypotheses"].values() if h["status"] == "open"}
-        )
-        if unsettled:
-            return answer(
-                "hyp_refute",
-                f"open hypotheses on incident(s) {unsettled}",
-            )
-
-        for fork_id in sorted(s["forks"]):
-            if fork_id not in s["decisions"]:
-                if not any(d["fork"] == fork_id for d in s["disputes"]):
-                    return answer("dispute", f"fork {fork_id!r} is open and undisputed")
-                return answer("decide", f"fork {fork_id!r} is disputed but undecided")
-
-        covered = {e["criterion"] for e in s["evidence"] if e["tier"] != "unavailable"}
-        short = [c for c in s["criteria"] if c not in covered]
-        if short:
-            return answer(
-                "record-evidence",
-                f"criteria with no executed evidence yet: {short}",
-            )
-
-        if parked:
-            return answer(
-                "resolve_block",
-                "everything else is verified; only the parked paths remain: " + "; ".join(parked),
-            )
-
-        blocking, _ = self.outcome()[1:]
-        if blocking:
-            return answer("record-risk", f"outstanding: {blocking}")
-        return answer("close", "the outcome is reached")
-
+        """Delegate to pure derivation module, passing validate_infra as callback."""
+        return derive_next_action(self.state, validate_infra_fn=self.validate_infra)
 
 # --------------------------------------------------------------------------- #
 # CLI
