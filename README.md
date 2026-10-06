@@ -25,6 +25,28 @@ Three entry points, all funnelling into the same ledger:
 - **NON-CONVERGENCE** — repetition is *classified*, never counted. A defective loop and an
   unresolved hypothesis are directives with no cap. Only a named missing fact stops a run.
 
+## Working from a spec
+
+`import-tickets` maps a `/to-tickets` issue directory onto acceptance criteria, keeping
+the ticket boundaries as provenance. A ticket *merged* upstream is not *earned* here:
+the report's `## Ticket provenance` section separates the two, and `close` refuses while
+any imported criterion is unverified. Tickets without verifiable criteria, duplicated
+criteria and dangling `Blocked by` edges are refused at intake and again on replay.
+Both to-tickets shapes are read — the local template and the issue template used on
+real trackers — with native ticket ids (`01`, `42`, `ENG-123`) and `Blocked by` edges as
+numbers, native keys, titles or tracker URLs, so a GitHub/Linear export imports
+unchanged. The `spec-implement` skill drives the whole loop (import → frontier →
+evidence → close) and is model-invocable, unlike the human-triggered `/implement-spec`.
+
+`route` gives a driving pipeline one routable word (`investigate` / `decide` / `unblock`
+/ `verify` / `human` / `close`) plus a fallback lane for when the primary one is blocked
+from outside the session. `init --intake` validates the magnet without writing anything;
+`freeze-intent` seals it so the only way to move the right edge is a disputed fork.
+
+Every report closes with `## Auto-critique`: the run names its own weaknesses — unfalsified
+searches, untraceable evidence, verdict-less disputes, overruled dissent, narrow searches,
+intent drift — each row pointing at a record.
+
 ## Why a machine and not prose
 
 The skills this composes with already state these rules, and already let them be skipped.
@@ -51,3 +73,8 @@ guards fails the suite:
 self-dispute gate · min-3-hypotheses · open-hypothesis-blocks-fix · dispute-before-decide
 irreversibility authority · tautology · criteria-coverage · red-capable loop
 ```
+
+Concurrency is covered at both levels: threads racing through the in-process lock, and
+real OS processes (each CLI invocation is one) racing through `flock` — exactly one
+winner for contested writes, no lost events, and `compact()` proven to replay to the
+same state after multi-process churn.

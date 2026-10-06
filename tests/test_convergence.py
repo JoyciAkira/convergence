@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 from convergence import (  # noqa: E402
     MIN_HYPOTHESES,
     Blocked,
+    IntakeError,
     Ledger,
     UsageError,
     main,
@@ -166,6 +167,159 @@ def test_a_huge_ledger_still_produces_a_readable_report(led):
     assert len(report) < 8000, f"report grew to {len(report)} bytes"
     assert "more; the full record is in" in report
     assert "`hypotheses.jsonl`" in report
+    assert "## Close conditions" in report
+    assert "## Revision transparency" in report
+    assert "## Dispute weights" in report
+    assert "## Meta: run-fail dataset" in report
+    assert "## Requirement notice" in report
+
+
+def test_report_has_explicit_close_conditions(led):
+    settled = two_refuted(led)
+    settled.open_hypothesis("H3", INCIDENT, "BOM handling", "stripping the BOM fixes it")
+    settled.close_hypothesis("H3", "BOM probe", "green", survives=True)
+    settled.begin_fix(INCIDENT, "binary mode")
+    settled.record_evidence("handles CRLF", "pytest -k crlf", "executed_here", expected_source="literal")
+    settled.record_evidence("rejects malformed", "pytest -k malformed", "executed_here", expected_source="spec")
+    report = settled.report()
+    assert "## Close conditions" in report
+    assert "every criterion verified: satisfied" in report
+    assert "no open hypothesis: satisfied" in report
+    assert "no undecided fork: satisfied" in report
+
+
+def test_close_conditions_reflect_blocking(led):
+    led.record_evidence("handles CRLF", "pytest", "executed_here", expected_source="literal")
+    report = led.report()
+    assert "## Close conditions" in report
+    assert "every criterion verified: unsatisfied" in report
+
+
+def test_revision_transparency_appears_when_criterion_moves(led):
+    led.open_fork(
+        "F1", "criterion drift", "the BOM fixture matters", "keep",
+        [
+            {"id": "keep", "cost": "0d", "risk": "low", "reversibility": "reversible"},
+            {"id": "revise", "cost": "1d", "risk": "med", "reversibility": "reversible"},
+        ],
+        criterion_from="handles CRLF",
+        criterion_to="handles CRLF and BOM-prefixed fixtures",
+        invalidation_rationale="BOM fixtures were never in the original report.",
+    )
+    led.dispute("F1", challenger="reviewer", author="main", steelman="keep the old line")
+    led.decide("F1", "revise", by="agent", invalidated=["AC-1"])
+    report = led.report()
+    assert "## Revision transparency" in report
+    assert "handles CRLF" in report
+    assert "handles CRLF and BOM-prefixed fixtures" in report
+
+
+def test_dispute_weights_appear_in_report(led):
+    led.open_fork(
+        "F1", "which queue?", "broker gone", "redis",
+        [
+            {"id": "pg", "cost": "3d", "risk": "med", "reversibility": "irreversible"},
+            {"id": "sqlite", "cost": "0d", "risk": "low", "reversibility": "reversible"},
+        ],
+    )
+    led.dispute("F1", challenger="reviewer", author="main", steelman="sqlite cannot hold the write volume")
+    led.decide("F1", "pg", by="human", human_ack=True, anchors=["security"],
+               invalidated=["the redis spike"])
+    report = led.report()
+    assert "## Dispute weights" in report
+    assert "weight=heavy" in report
+
+
+def test_meta_fail_dataset_appears_on_close(led):
+    led.record_meta_fail("run-1", "not_reached")
+    report = led.report()
+    assert "## Meta: run-fail dataset" in report
+    assert "run-1" in report
+
+
+def test_intake_gate_enforces_shape_before_freeze(led):
+    with pytest.raises(IntakeError, match="no criteria"):
+        Ledger.validate_intent("ship the parser", [])
+    with pytest.raises(IntakeError, match="shorter than 4"):
+        Ledger.validate_intent("ship the parser", ["x", "handles CRLF"])
+    validated = Ledger.validate_intent("ship the parser", ["handles CRLF", "rejects malformed"])
+    assert validated["intent"] == "ship the parser"
+    assert validated["criteria"] == ["handles CRLF", "rejects malformed"]
+
+
+def test_freeze_without_criteria_is_refused(tmp_path):
+    # Build a ledger with no criteria by editing the control log
+    (tmp_path / "L").mkdir()
+    (tmp_path / "L" / "control.jsonl").write_text(
+        json.dumps({"ev": "init", "intent": "ship", "criteria": [], "at": 0}) + "\n"
+    )
+    led3 = Ledger(tmp_path / "L")
+    with pytest.raises(Blocked, match="no acceptance criteria"):
+        led3.freeze_intent()
+
+
+def test_intent_frozen_event_is_persisted(led):
+    led.freeze_intent()
+    assert led.state["intent_frozen"] is True
+    assert led.state["intent_freeze_at"] is not None
+
+
+def test_compact_replays_to_the_same_state(tmp_path):
+    led = two_refuted(Ledger.create(tmp_path / "L", "ship", ["handles CRLF"]))
+    led.record_evidence("handles CRLF", "pytest", "executed_here", expected_source="literal")
+    led.freeze_intent()
+    reopened = led.compact()
+    assert reopened.state["intent"] == led.state["intent"]
+    assert reopened.state["criteria"] == led.state["criteria"]
+    assert reopened.state["intent_frozen"] is True
+    assert reopened.state["loops"] == led.state["loops"]
+
+
+def test_compact_refuses_if_state_diverges_under_replay(tmp_path):
+    """A ledger whose in-memory state is stale must refuse to snapshot: replay
+    sees writes this process never absorbed, and compacting the stale view would
+    silently drop them."""
+    led = Ledger.create(tmp_path / "L", "ship", ["handles CRLF"])
+    led.freeze_intent()
+    stale = Ledger(tmp_path / "L")
+    # Another process lands a write after `stale` loaded its state.
+    led.record_risk("an external write landed here")
+    with pytest.raises(Blocked, match="diverges"):
+        stale.compact()
+    # The external write survives the refused compact.
+    fresh = Ledger(tmp_path / "L")
+    assert any(r["text"] == "an external write landed here" for r in fresh.state["risks"])
+
+
+def test_catalog_spec_resolve_known_and_unknown(tmp_path):
+    assert Ledger.resolve_catalog_spec("postgres")["driver"] == "postgresql"
+    assert Ledger.resolve_catalog_spec("sqlite")["driver"] == "sqlite"
+    assert Ledger.resolve_catalog_spec("unknown")["driver"] == "unknown"
+
+
+def test_provision_env_catalog_uses_placeholder_command(tmp_path):
+    led = Ledger.create(tmp_path / "L", "ship", ["handles CRLF"])
+    led.provision_env_catalog("postgres", "DATABASE_URL")
+    prov = led.state["infra"]["provisions"][-1]
+    assert prov["spec"] == "postgresql"
+    assert prov["command"] == "echo postgresql://user:pass@host:5432/db"
+    assert prov["output_var"] == "DATABASE_URL"
+
+
+def test_dispute_weight_heuristics(led):
+    heavy = Ledger.decision_weight("", [], "irreversible")
+    assert heavy == "heavy"
+    medium = Ledger.decision_weight("", ["data_integrity"], "reversible")
+    assert medium == "medium"
+    light = Ledger.decision_weight("", [], "reversible")
+    assert light == "light"
+    heavy2 = Ledger.decision_weight("", ["money"], "reversible")
+    assert heavy2 == "heavy"
+
+def test_freeze_twice_is_refused(led):
+    led.freeze_intent()
+    with pytest.raises(Blocked, match="already frozen"):
+        led.freeze_intent()
 
 
 def test_three_settled_hypotheses_unlock_the_fix(led):
@@ -604,6 +758,7 @@ def run_cli(*args):
         [sys.executable, str(ROOT / "lib" / "convergence.py"), *args],
         capture_output=True,
         text=True,
+        timeout=60,
     )
 
 
@@ -645,7 +800,8 @@ def test_work_after_a_park_passes_and_later_unavailable_fails(tmp_path):
     assert led.outcome()[0] == "REACHED"
     report = led.report()
     passed = report.split("**Passed**")[1].split("**Failed**")[0]
-    unavailable = report.split("**Unavailable**")[1]
+    # the Unavailable bucket ends at the next section header, not at the report end
+    unavailable = report.split("**Unavailable**")[1].split("\n## ")[0]
     assert "e2e passes" in passed, "work after a park must appear under Passed"
     assert "e2e passes" not in unavailable
 
@@ -680,6 +836,51 @@ def test_a_full_run_closes_zero_through_the_cli(tmp_path):
     result = run_cli("close", str(path))
     assert result.returncode == 0
     assert "**REACHED**" in result.stdout
+    r = Ledger(path)
+    report = r.report()
+    assert "## Close conditions" in report
+    assert "## Revision transparency" in report
+    assert "## Dispute weights" in report
+    assert "## Meta: run-fail dataset" in report
+    assert "## Requirement notice" in report
+    assert "The run is complete. No condition remains open." in report
+
+
+def test_intake_mode_through_cli(tmp_path):
+    out = run_cli("init", str(tmp_path / "L"), "--intent", "ship it",
+                  "--criterion", "works", "--intake")
+    assert out.returncode == 0, out.stderr
+    data = json.loads(out.stdout)
+    assert data["shape_ok"] is True
+    assert not (tmp_path / "L").exists()
+
+
+def test_intake_mode_rejects_no_criteria_through_cli(tmp_path):
+    out = run_cli("init", str(tmp_path / "L"), "--intent", "ship it", "--intake")
+    # intake refusals are IntakeError -> exit 2, and the shape is reported, not guessed
+    assert out.returncode == 2, (out.stdout, out.stderr)
+    data = json.loads(out.stdout)
+    assert data["shape_ok"] is False
+    assert not (tmp_path / "L").exists()
+
+
+def test_close_records_meta_fail_when_not_reached(tmp_path):
+    path = tmp_path / "L"
+    run_cli("init", str(path), "--intent", "ship it", "--criterion", "works")
+    result = run_cli("close", str(path))
+    assert result.returncode == 3
+    led = Ledger(path)
+    assert led.state["meta"]["run_fails"][-1]["failure_kind"] == "not_reached"
+
+
+def test_freeze_twice_is_refused_through_cli(tmp_path):
+    path = tmp_path / "L"
+    run_cli("init", str(path), "--intent", "ship it", "--criterion", "works")
+    first = run_cli("freeze-intent", str(path))
+    assert first.returncode == 0
+    second = run_cli("freeze-intent", str(path))
+    assert second.returncode == 3
+    assert "already frozen" in second.stderr
 
 
 def test_main_is_importable_for_in_process_gating(tmp_path):
@@ -984,6 +1185,76 @@ def test_a_contested_fork_is_decided_exactly_once(tmp_path):
     assert len(events) == 1, "two decisions landed and one silently overwrote the other"
 
 
+def test_many_processes_write_without_losing_a_single_event(tmp_path):
+    """The lock path that only real OS processes exercise: every run_cli is its own
+    process, each re-reading the ledger under flock. Interleaved writes must all
+    land, and the derived state must equal a clean replay of the logs."""
+    path = tmp_path / "L"
+    words = ["clock", "socket", "kernel", "cursor", "manifest", "padding",
+             "locale", "checksum", "timeout", "segment", "vacuum", "trigger"]
+    criteria = [f"criterion-{i:02d} is satisfied" for i in range(len(words))]
+    assert run_cli("init", str(path), "--intent", "x", "--criterion", *criteria).returncode == 0
+
+    def worker(i):
+        out = run_cli("record-evidence", str(path), "--criterion", criteria[i],
+                      "--command", f"pytest -k e{i}", "--tier", "executed_here",
+                      "--expected-source", "literal")
+        return out.returncode
+
+    with ThreadPoolExecutor(max_workers=len(words)) as pool:
+        codes = list(pool.map(worker, range(len(words))))
+    assert codes == [0] * len(words), codes
+
+    final = Ledger(path)
+    assert len(final.state["evidence"]) == len(words), "a process's write was lost"
+    clean = Ledger(path)
+    assert clean.state["criteria"] == criteria
+
+
+def test_many_processes_racing_on_one_hypothesis_have_exactly_one_winner(tmp_path):
+    path = tmp_path / "L"
+    assert run_cli("init", str(path), "--intent", "x").returncode == 0
+    assert run_cli("declare-loop", str(path), "--incident", INCIDENT,
+                   "--command", "pytest", "--symptom", "import blows up").returncode == 0
+    assert run_cli("run-loop", str(path), "--incident", INCIDENT,
+                   "--red", "true").returncode == 0
+
+    def worker(i):
+        out = run_cli("open-hypothesis", str(path), "--id", f"H{i}",
+                      "--incident", INCIDENT, "--claim", "the null guard is absent",
+                      "--prediction", "adding it turns the loop green")
+        return out.returncode
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = list(pool.map(worker, range(8)))
+    assert codes.count(0) == 1, f"exactly one process may win the id race: {codes}"
+    assert len(Ledger(path).state["hypotheses"]) == 1
+
+
+def test_compact_after_multiprocess_churn_replays_to_the_same_state(tmp_path):
+    """Compaction is only honest if the snapshot derives the same state as the
+    logs it replaces — checked here after real multi-process interleaving."""
+    path = tmp_path / "L"
+    criteria = [f"criterion-{i:02d} is satisfied" for i in range(8)]
+    assert run_cli("init", str(path), "--intent", "x", "--criterion", *criteria).returncode == 0
+
+    def worker(i):
+        return run_cli("record-evidence", str(path), "--criterion", criteria[i],
+                       "--command", f"pytest -k e{i}", "--tier", "executed_here",
+                       "--expected-source", "literal").returncode
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = list(pool.map(worker, range(8)))
+    assert codes == [0] * 8, codes
+
+    stale = Ledger(path)
+    before = {k: v for k, v in stale.state.items() if k != "events"}
+    reopened = stale.compact()
+    after = {k: v for k, v in reopened.state.items() if k != "events"}
+    assert after == before, "the compacted ledger does not derive the same state"
+    assert len(reopened.state["evidence"]) == 8
+
+
 # --------------------------------------------------------------------------- #
 # found by the first real agent to use the skill
 # --------------------------------------------------------------------------- #
@@ -1219,3 +1490,391 @@ def test_validate_infra_checks_a_running_runtime_and_ignores_a_stopped_one(tmp_p
     result = led.validate_infra()
     assert result["ready"], "a stopped runtime is not a missing prerequisite"
     assert not [c for c in result["checks"] if c["type"] == "runtime"]
+
+
+# --------------------------------------------------------------------------- #
+# (10) auto-critique: the report names the run's own weaknesses first
+# --------------------------------------------------------------------------- #
+
+
+def test_auto_critique_calls_out_an_unfalsified_search(led):
+    armed(led)
+    led.open_hypothesis("H1", INCIDENT, "universal newlines strip CR", "isort will strip the CR")
+    led.close_hypothesis("H1", "pytest -k crlf", "looks plausible", survives=True)
+    rows = led.auto_critique()
+    crit = "\n".join(rows)
+    assert "adversarial search: weak" in crit
+    assert "0 refuted" in crit
+
+
+def test_auto_critique_passes_a_search_that_refuted(led):
+    two_refuted(led)
+    rows = led.auto_critique()
+    crit = "\n".join(rows)
+    assert "adversarial search: ok" in crit
+    assert "1 of 2 hypotheses refuted" in crit
+
+
+def test_auto_critique_calls_out_untraceable_evidence(led):
+    led.record_evidence("handles CRLF", "pytest", "executed_here", expected_source="literal")
+    rows = led.auto_critique()
+    crit = "\n".join(rows)
+    assert "evidence traceability: weak" in crit
+    assert "output-ref" in crit
+
+
+def test_auto_critique_passes_traceable_evidence(led):
+    led.record_evidence("handles CRLF", "pytest", "executed_here",
+                        expected_source="literal", output_ref="runs/crlf.log")
+    crit = "\n".join(led.auto_critique())
+    assert "evidence traceability: ok" in crit
+
+
+def test_auto_critique_calls_out_a_single_shot_verification(led):
+    led.record_evidence("handles CRLF", "pytest", "executed_here",
+                        expected_source="literal", output_ref="runs/crlf.log")
+    crit = "\n".join(led.auto_critique())
+    assert "independent reproduction: weak" in crit
+    assert "handles CRLF" in crit
+
+
+def test_auto_critique_calls_out_a_verdictless_dispute(led):
+    led.open_fork(
+        "F1", "which queue?", "broker gone", "redis",
+        [
+            {"id": "pg", "cost": "3d", "risk": "med", "reversibility": "reversible"},
+            {"id": "sqlite", "cost": "0d", "risk": "low", "reversibility": "reversible"},
+        ],
+    )
+    led.dispute("F1", challenger="reviewer", author="main", steelman="sqlite cannot hold the write volume")
+    led.decide("F1", "pg", by="agent", invalidated=["the redis spike"])
+    crit = "\n".join(led.auto_critique())
+    assert "dispute verdicts: weak" in crit
+    assert "F1" in crit
+
+
+def test_auto_critique_calls_out_overruled_dissent_and_narrow_search(led):
+    led.open_fork(
+        "F1", "which queue?", "broker gone", "redis",
+        [
+            {"id": "pg", "cost": "3d", "risk": "med", "reversibility": "reversible"},
+            {"id": "sqlite", "cost": "0d", "risk": "low", "reversibility": "reversible"},
+        ],
+    )
+    led.dispute("F1", challenger="reviewer", author="main", steelman="sqlite cannot hold the write volume")
+    led.decide("F1", "pg", by="agent", invalidated=["the redis spike"],
+               challenger_overruled=True,
+               override_reason="the counter-example did not reproduce")
+    two_refuted(led)
+    led.begin_fix(INCIDENT, "binary mode", search="narrow")
+    crit = "\n".join(led.auto_critique())
+    assert "overruled dissent: weak" in crit
+    assert "search width: weak" in crit
+
+
+def test_auto_critique_notes_intent_drift(led):
+    led.open_fork(
+        "F1", "criterion drift", "the BOM fixture matters", "keep",
+        [
+            {"id": "keep", "cost": "0d", "risk": "low", "reversibility": "reversible"},
+            {"id": "revise", "cost": "1d", "risk": "med", "reversibility": "reversible"},
+        ],
+        criterion_from="handles CRLF",
+        criterion_to="handles CRLF and BOM-prefixed fixtures",
+        invalidation_rationale="BOM fixtures were never in the original report.",
+    )
+    led.dispute("F1", challenger="reviewer", author="main", steelman="keep the old line")
+    led.decide("F1", "revise", by="agent", invalidated=["AC-1"])
+    crit = "\n".join(led.auto_critique())
+    assert "intent drift: note" in crit
+
+
+def test_auto_critique_appears_in_the_report(led):
+    report = led.report()
+    assert "## Auto-critique" in report
+    assert "adversarial search" in report
+
+
+# --------------------------------------------------------------------------- #
+# (4) upper-pipeline routing: one lane to route on, with a fallback
+# --------------------------------------------------------------------------- #
+
+
+def test_route_names_the_investigate_lane_for_an_open_hypothesis(led):
+    armed(led)
+    led.open_hypothesis("H1", INCIDENT, "universal newlines strip CR", "isort will strip the CR")
+    route = led.pipeline_route()
+    assert route["lane"] == "investigate"
+    assert route["fallback"]["lane"] == "verify"
+
+
+def test_route_names_the_decide_lane_for_a_disputed_fork(led):
+    led.open_fork(
+        "F1", "which queue?", "broker gone", "redis",
+        [
+            {"id": "pg", "cost": "3d", "risk": "med", "reversibility": "reversible"},
+            {"id": "sqlite", "cost": "0d", "risk": "low", "reversibility": "reversible"},
+        ],
+    )
+    led.dispute("F1", challenger="reviewer", author="main", steelman="sqlite cannot hold the write volume")
+    route = led.pipeline_route()
+    assert route["lane"] == "decide"
+
+
+def test_route_escalates_a_fork_with_no_reversible_option(led):
+    led.open_fork(
+        "F1", "drop the table or not?", "schema drift", "keep",
+        [
+            {"id": "drop", "cost": "0d", "risk": "high", "reversibility": "irreversible"},
+            {"id": "archive", "cost": "2d", "risk": "med", "reversibility": "irreversible"},
+        ],
+    )
+    led.dispute("F1", challenger="reviewer", author="main", steelman="archiving costs downtime too")
+    route = led.pipeline_route()
+    assert route["lane"] == "human"
+    assert "irreversible" in route["because"]
+    # the run still has a fallback lane instead of stalling on the escalation
+    assert route["fallback"]["lane"] == "verify"
+
+
+def test_route_parks_to_unblock_with_a_verify_fallback(led):
+    led.classify(
+        "flake-1", "information_missing",
+        missing_fact="the staging database password",
+        smallest_input="the password pasted by the operator",
+        tried=["read the vault", "asked in #ops"],
+        park="staging is behind an operator-only credential",
+    )
+    route = led.pipeline_route()
+    assert route["lane"] == "unblock"
+    assert route["fallback"]["lane"] == "verify"
+    assert "work, not a stop" in route["fallback"]["because"]
+
+
+def test_route_says_close_when_the_outcome_is_reached(led):
+    two_refuted(led)
+    led.open_hypothesis("H3", INCIDENT, "the parser drops the BOM", "stripping the BOM fixes it")
+    led.close_hypothesis("H3", "BOM-strip probe", "went green", survives=True)
+    led.begin_fix(INCIDENT, "binary mode")
+    led.record_evidence("handles CRLF", "pytest", "executed_here",
+                        expected_source="literal", output_ref="runs/crlf.log")
+    led.record_evidence("rejects malformed", "pytest", "executed_here",
+                        expected_source="literal", output_ref="runs/malformed.log")
+    route = led.pipeline_route()
+    assert route["lane"] == "close"
+    assert route["fallback"] is None
+
+
+def test_route_through_the_cli_prints_json(tmp_path):
+    path = tmp_path / "L"
+    run_cli("init", str(path), "--intent", "ship it", "--criterion", "works")
+    out = run_cli("route", str(path))
+    assert out.returncode == 0, out.stderr
+    data = json.loads(out.stdout)
+    assert data["lane"] == "verify"
+    assert data["fallback"]["lane"] == "close"
+    assert "action" in data and "because" in data
+
+
+# --------------------------------------------------------------------------- #
+# spec integration: tickets map onto criteria, merging != earning
+# --------------------------------------------------------------------------- #
+
+
+def write_ticket(dirpath, number, title, criteria, blocked_by="None (can start immediately)",
+                 what="the end-to-end behaviour"):
+    dirpath.mkdir(parents=True, exist_ok=True)
+    body = (f"# {number}: {title}\n\n"
+            f"**What to build:** {what}\n\n"
+            f"**Blocked by:** {blocked_by}\n\n"
+            f"**Status:** ready-for-agent\n\n"
+            + "\n".join(f"- [ ] {c}" for c in criteria) + "\n")
+    (dirpath / f"{number}-{title.lower().replace(' ', '-')}.md").write_text(body)
+
+
+def test_import_tickets_maps_criteria_and_keeps_boundaries(tmp_path):
+    tickets = tmp_path / "issues"
+    write_ticket(tickets, "01", "Parser reads CRLF", ["import survives CRLF input"])
+    write_ticket(tickets, "02", "Reject malformed", ["malformed input raises", "error names the line"],
+                 blocked_by="01")
+    led = Ledger.create(tmp_path / "L", "ship the parser", ["shipped"])
+    led.import_tickets(tickets)
+    assert [t["id"] for t in led.state["tickets"]] == ["01", "02"]
+    assert "import survives CRLF input" in led.state["criteria"]
+    assert "error names the line" in led.state["criteria"]
+    assert led.state["tickets"][1]["blocked_by"] == ["01"]
+    assert led.state["tickets"][0]["status"] == "ready-for-agent"
+
+
+def test_ticket_with_no_acceptance_criterion_is_refused_at_intake(tmp_path):
+    tickets = tmp_path / "issues"
+    write_ticket(tickets, "01", "Vague ticket", [])
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    with pytest.raises(IntakeError, match="no acceptance criterion"):
+        led.import_tickets(tickets)
+    assert led.state["tickets"] == []
+
+
+def test_ticket_with_unverifiable_criterion_is_refused(tmp_path):
+    tickets = tmp_path / "issues"
+    write_ticket(tickets, "01", "Short checks", ["ok"])
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    with pytest.raises(IntakeError, match="shorter than 4"):
+        led.import_tickets(tickets)
+
+
+def test_dangling_blocked_by_edge_is_refused(tmp_path):
+    tickets = tmp_path / "issues"
+    write_ticket(tickets, "01", "Real ticket", ["real criterion"], blocked_by="02")
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    with pytest.raises(UsageError, match="unknown ticket"):
+        led.import_tickets(tickets)
+
+
+def test_duplicated_criterion_across_tickets_is_refused(tmp_path):
+    tickets = tmp_path / "issues"
+    write_ticket(tickets, "01", "First", ["shared criterion"])
+    write_ticket(tickets, "02", "Second", ["shared criterion"])
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    with pytest.raises(UsageError, match="exactly one ticket"):
+        led.import_tickets(tickets)
+
+
+def test_merging_a_ticket_without_evidence_still_blocks_the_close(tmp_path):
+    """The point of the mapping: a ticket merged upstream is not earned here.
+    Its criteria sit in the flat list, so close refuses until evidence lands."""
+    tickets = tmp_path / "issues"
+    write_ticket(tickets, "01", "Parser reads CRLF", ["import survives CRLF input"])
+    led = Ledger.create(tmp_path / "L", "ship the parser", ["shipped"])
+    led.import_tickets(tickets)
+    led.record_evidence("shipped", "pytest", "executed_here",
+                        expected_source="literal", output_ref="runs/ship.log")
+    status, blocking, _ = led.outcome()
+    assert status == "NOT REACHED"
+    assert any("import survives CRLF input" in b for b in blocking)
+
+
+def test_ticket_provenance_separates_earned_from_merged(tmp_path):
+    tickets = tmp_path / "issues"
+    write_ticket(tickets, "01", "Earned ticket", ["criterion a proven"])
+    write_ticket(tickets, "02", "Merged only", ["criterion b proven"])
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    led.import_tickets(tickets)
+    led.record_evidence("criterion a proven", "pytest", "executed_here",
+                        expected_source="literal", output_ref="runs/a.log")
+    report = led.report()
+    prov = report.split("## Ticket provenance")[1].split("\n## ")[0]
+    assert "earned" in prov and "01" in prov
+    assert "merged only" in prov and "02" in prov
+    assert "criterion b proven" in prov, "the unproven criterion must be named"
+
+
+def test_import_tickets_through_the_cli(tmp_path):
+    tickets = tmp_path / "issues"
+    write_ticket(tickets, "01", "Parser reads CRLF", ["import survives CRLF input"])
+    path = tmp_path / "L"
+    run_cli("init", str(path), "--intent", "ship it", "--criterion", "works")
+    out = run_cli("import-tickets", str(path), "--tickets", str(tickets))
+    assert out.returncode == 0, out.stderr
+    assert "ticket 01" in out.stdout
+    assert "import survives CRLF input" in Ledger(path).state["criteria"]
+
+
+def test_import_tickets_cli_refuses_a_criterionless_ticket(tmp_path):
+    tickets = tmp_path / "issues"
+    write_ticket(tickets, "01", "Vague ticket", [])
+    path = tmp_path / "L"
+    run_cli("init", str(path), "--intent", "ship it", "--criterion", "works")
+    out = run_cli("import-tickets", str(path), "--tickets", str(tickets))
+    assert out.returncode == 2
+    assert "INTAKE" in out.stderr
+    assert Ledger(path).state["tickets"] == []
+
+
+# --- real-tracker exports: native ids and the issue template ---------------- #
+
+
+def write_issue_ticket(dirpath, filename, title, criteria, blocked_by=None,
+                       what="the end-to-end behaviour"):
+    """The <issue-template> shape used on real trackers: ## sections, native ids."""
+    dirpath.mkdir(parents=True, exist_ok=True)
+    body = (f"# {title}\n\n"
+            f"## What to build\n\n{what}\n\n"
+            f"## Acceptance criteria\n\n"
+            + "\n".join(f"- [ ] {c}" for c in criteria) + "\n\n")
+    if blocked_by is not None:
+        body += "## Blocked by\n\n" + "\n".join(f"- {b}" for b in blocked_by) + "\n"
+    (dirpath / filename).write_text(body)
+
+
+def test_native_ids_from_filenames_and_headings(tmp_path):
+    tickets = tmp_path / "issues"
+    write_issue_ticket(tickets, "ENG-123.md", "Parser reads CRLF", ["import survives CRLF input"])
+    write_issue_ticket(tickets, "7.md", "Reject malformed", ["malformed input raises"],
+                       blocked_by=["None (can start immediately)"])
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    led.import_tickets(tickets)
+    assert [t["id"] for t in led.state["tickets"]] == ["7", "ENG-123"]
+    assert led.state["tickets"][1]["id"] == "ENG-123"
+
+
+def test_issue_template_sections_are_parsed(tmp_path):
+    tickets = tmp_path / "issues"
+    write_issue_ticket(tickets, "ENG-1.md", "Full template", ["criterion one works"],
+                       blocked_by=["None (can start immediately)"], what="a complete slice")
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    led.import_tickets(tickets)
+    t = led.state["tickets"][0]
+    assert t["what_to_build"] == "a complete slice"
+    assert t["criteria"] == ["criterion one works"]
+    assert t["blocked_by"] == []
+
+
+def test_blocked_by_accepts_native_keys_urls_and_padding_insensitive_numbers(tmp_path):
+    tickets = tmp_path / "issues"
+    write_issue_ticket(tickets, "01-base.md", "Base ticket", ["base criterion works"])
+    write_issue_ticket(tickets, "ENG-2.md", "Follow-up", ["follow-up criterion works"],
+                       blocked_by=["#1", "ENG-3",
+                                   "https://tracker.example/issues/9"])
+    write_issue_ticket(tickets, "ENG-3.md", "Third", ["third criterion works"])
+    write_issue_ticket(tickets, "9.md", "URL target", ["url target criterion works"])
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    led.import_tickets(tickets)
+    follow = next(t for t in led.state["tickets"] if t["id"] == "ENG-2")
+    # '#1' finds '01' by value, 'ENG-3' exactly, the URL yields '9'
+    assert follow["blocked_by"] == ["01", "ENG-3", "9"]
+
+
+def test_dangling_native_key_edge_is_refused(tmp_path):
+    tickets = tmp_path / "issues"
+    write_issue_ticket(tickets, "ENG-1.md", "Orphan", ["orphan criterion works"],
+                       blocked_by=["ENG-999"])
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    with pytest.raises(UsageError, match="unknown ticket"):
+        led.import_tickets(tickets)
+
+
+def test_heading_without_id_falls_back_to_filename(tmp_path):
+    tickets = tmp_path / "issues"
+    write_issue_ticket(tickets, "ENG-42.md", "Title only", ["title-only criterion works"])
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    led.import_tickets(tickets)
+    assert led.state["tickets"][0]["id"] == "ENG-42"
+    assert led.state["tickets"][0]["title"] == "Title only"
+
+
+def test_filename_without_id_and_heading_without_id_is_refused(tmp_path):
+    tickets = tmp_path / "issues"
+    write_issue_ticket(tickets, "no-id-here.md", "Anonymous", ["anonymous criterion works"])
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    with pytest.raises(UsageError, match="does not look like one"):
+        led.import_tickets(tickets)
+
+
+def test_provenance_formats_native_ids(tmp_path):
+    tickets = tmp_path / "issues"
+    write_issue_ticket(tickets, "ENG-7.md", "Native provenance", ["native criterion works"])
+    led = Ledger.create(tmp_path / "L", "ship", ["shipped"])
+    led.import_tickets(tickets)
+    prov = led.report().split("## Ticket provenance")[1].split("\n## ")[0]
+    assert "ticket ENG-7" in prov

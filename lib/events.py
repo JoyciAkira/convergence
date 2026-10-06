@@ -17,6 +17,41 @@ from exceptions import Blocked, UsageError
 def _ev_init(s: dict, ev: dict) -> None:
     s["intent"] = ev["intent"]
     s["criteria"] = list(ev.get("criteria") or [])
+    s["intent_frozen"] = False
+    s["intent_freeze_at"] = None
+    s["infra"] = {}
+    s["meta"] = {}
+    s["tickets"] = []
+
+
+def _ev_intent_frozen(s: dict, ev: dict) -> None:
+    s["intent_frozen"] = True
+    s["intent_freeze_at"] = ev["at"]
+
+
+def _ev_tickets_imported(s: dict, ev: dict) -> None:
+    """Map tickets from the spec's task graph onto acceptance criteria.
+
+    Ticket boundaries are kept as provenance: the report can then say which
+    ticket earned its close and which was merely merged. Validation lives here,
+    not only in the caller, so replay refuses the same violations.
+    """
+    tickets = s.setdefault("tickets", [])
+    known_ids = {t["id"] for t in tickets}
+    known_criteria = set(s.get("criteria", []))
+    for t in ev.get("tickets", []):
+        if t["id"] in known_ids:
+            raise UsageError(f"ticket {t['id']} is already imported")
+        for c in t.get("criteria", []):
+            if c in known_criteria:
+                raise UsageError(
+                    f"criterion {c!r} is already an acceptance criterion; each must map "
+                    f"to exactly one ticket, or the report cannot say which earned it"
+                )
+        known_ids.add(t["id"])
+        known_criteria.update(t.get("criteria", []))
+        tickets.append(dict(t))
+        s["criteria"] = list(s.get("criteria", [])) + list(t.get("criteria", []))
 
 
 def _ev_loop_declare(s: dict, ev: dict) -> None:
@@ -119,6 +154,27 @@ def _ev_classify(s: dict, ev: dict) -> None:
         s["directive"] = None
     else:
         s["directive"] = {"kind": ev["kind"], "set_at": ev["at"]}
+
+
+def _ev_snapshot(s: dict, ev: dict) -> None:
+    """Compaction checkpoint: replace the state wholesale with the snapshotted one.
+
+    Written only by Ledger.compact(), after proving the snapshot replays to the
+    same derived state as the logs it replaces.
+    """
+    s.clear()
+    s.update(ev["state"])
+    s.setdefault("events", 0)
+
+
+def _ev_meta_record(s: dict, ev: dict) -> None:
+    s.setdefault("meta", {}).setdefault("run_fails", []).append(
+        {
+            "signature": ev.get("signature"),
+            "failure_kind": ev.get("failure_kind"),
+            "at": ev["at"],
+        }
+    )
 
 
 def _ev_directive_clear(s: dict, ev: dict) -> None:
@@ -291,6 +347,10 @@ HANDLERS: dict[str, Any] = {
     "store_secret": _ev_store_secret,
     "boot_runtime": _ev_boot_runtime,
     "stop_runtime": _ev_stop_runtime,
+    "intent_frozen": _ev_intent_frozen,
+    "tickets_imported": _ev_tickets_imported,
+    "meta_record": _ev_meta_record,
+    "snapshot": _ev_snapshot,
 }
 
 

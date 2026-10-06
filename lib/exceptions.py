@@ -14,3 +14,8 @@ class Blocked(Exception):
 class UsageError(Exception):
     """Malformed input or corrupt log. Exit code 2."""
     pass
+
+
+class IntakeError(Exception):
+    """The requested intent could not be stabilised into a verifiable magnet."""
+    pass

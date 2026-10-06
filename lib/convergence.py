@@ -30,9 +30,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from runtime import FakeRuntimeManager, RealOSRuntimeManager, RuntimeManager
 from events import HANDLERS, apply_event
-from derivation import next_action as derive_next_action, outcome as derive_outcome, report as derive_report
-from exceptions import Blocked, UsageError
+from derivation import (
+    auto_critique as derive_auto_critique,
+    next_action as derive_next_action,
+    outcome as derive_outcome,
+    pipeline_route as derive_pipeline_route,
+    report as derive_report,
+)
+from exceptions import Blocked, IntakeError, UsageError
 from comparator import ClaimComparator, JaccardComparator
+
+import hashlib
 
 LEDGER_VERSION = 2
 
@@ -127,6 +135,22 @@ DIRECTIVE_REQUIRES = {
     "hypothesis_unresolved": ("hyp_refute", "hyp_survive", "hyp_merge"),
     "information_missing": (),
 }
+
+# --------------------------------------------------------------------------- #
+# closed conditions: explicit close bar (9)
+# --------------------------------------------------------------------------- #
+
+CLOSED_CONDITIONS = (
+    "every criterion verified",
+    "no open hypothesis",
+    "no undecided fork",
+    "no unresolved missing-fact block",
+    "no unrebuilt defective loop",
+    "no blocking risk",
+    "no criterion verified unavailable",
+    "no criterion never verified",
+    "infra ready or none registered",
+)
 
 DIRECTIVE_MESSAGE = {
     "loop_defective": (
@@ -362,10 +386,22 @@ def one_of(value, allowed, label):
 # --------------------------------------------------------------------------- #
 
 
+def _comparable(state):
+    """State minus the bookkeeping counter, for snapshot/replay equality checks.
+
+    `events` increments on every applied event, so a snapshot replay necessarily
+    counts one more application than the run that produced it; everything else in
+    the state must match exactly.
+    """
+    return {k: v for k, v in state.items() if k != "events"}
+
+
 def empty_state():
     return {
         "version": LEDGER_VERSION,
         "intent": None,
+        "intent_frozen": False,
+        "intent_freeze_at": None,
         "criteria": [],
         "loops": {},
         "hypotheses": {},
@@ -380,6 +416,9 @@ def empty_state():
         "directive": None,
         "criterion_revisions": [],
         "events": 0,
+        "infra": {},
+        "meta": {},
+        "tickets": [],
     }
 
 
@@ -424,9 +463,57 @@ class Ledger:
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
+    # -- multi-agent + compact (5) ------------------------------------------- #
+
+    def compact(self):
+        """Compact the logs into a single snapshot event, losslessly.
+
+        Compaction is only honest if the compacted ledger derives the exact same
+        state. So: replay the logs first and refuse if they disagree with the state
+        this instance holds (someone wrote after we loaded — snapshotting a stale
+        view would be silent data loss), archive the originals, write one snapshot
+        event, and prove the compacted ledger replays to the same state before
+        returning it. On any divergence the originals are restored and the call is
+        refused.
+        """
+        import shutil
+
+        clean = empty_state()
+        for name in ("control", "hypotheses", "forks", "evidence"):
+            self._replay(self.root / LOGS[name], clean)
+        if _comparable(clean) != _comparable(self.state):
+            raise Blocked(
+                "compact refused: replayed state diverges from current state — the "
+                "ledger changed under this process. Re-open and retry."
+            )
+        snapshot = {"ev": "snapshot", "at": time.time(), "state": copy.deepcopy(self.state)}
+        archive = self.root / "archive" / f"{int(time.time() * 1000)}"
+        archive.mkdir(parents=True, exist_ok=True)
+        for name in LOGS.values():
+            path = self.root / name
+            if path.exists():
+                shutil.copy2(path, archive / name)
+                path.write_text("", encoding="utf-8")
+        with (self.root / LOGS["control"]).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(snapshot, sort_keys=True) + "\n")
+        reopened = Ledger(
+            self.root,
+            runtime_manager=self.runtime_manager,
+            claim_comparator=self.claim_comparator,
+        )
+        if _comparable(reopened.state) != _comparable(self.state):
+            for name in LOGS.values():
+                shutil.copy2(archive / name, self.root / name)
+            raise Blocked(
+                "compact refused: the compacted ledger diverges from the original; "
+                "originals restored"
+            )
+        return reopened
+
     # -- plumbing ----------------------------------------------------------- #
 
-    def _replay(self, path):
+    def _replay(self, path, state=None):
+        target = self.state if state is None else state
         if not path.exists():
             return
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
@@ -438,7 +525,7 @@ class Ledger:
             except json.JSONDecodeError as exc:
                 raise UsageError(f"corrupt ledger: {path.name}:{lineno} is not JSON") from exc
             try:
-                apply_event(self.state, ev)
+                apply_event(target, ev)
             except (Blocked, UsageError) as exc:
                 raise UsageError(f"corrupt ledger: {path.name}:{lineno}: {exc}") from exc
 
@@ -505,7 +592,7 @@ class Ledger:
     # -- init --------------------------------------------------------------- #
 
     @classmethod
-    def create(cls, root, intent, criteria=()):
+    def create(cls, root, intent, criteria=(), freeze=False):
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
         with (root / LOCK).open("a") as handle:
@@ -524,9 +611,92 @@ class Ledger:
                         "criteria": list(criteria or []),
                     },
                 )
+                if freeze:
+                    if not ledger.state["criteria"]:
+                        raise Blocked(
+                            "cannot freeze an intent that still has no acceptance criteria"
+                        )
+                    # Not freeze_intent(): that would re-enter the lock this
+                    # classmethod already holds, and flock is not re-entrant across
+                    # two open() descriptions of the same file — the second waits
+                    # forever. Append the event directly; we are already inside the
+                    # read-validate-write section.
+                    ledger._append("control", {"ev": "intent_frozen"})
                 return ledger
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
+
+    @transactional
+    def freeze_intent(self):
+        """Seal the right edge signal: after this, intent/criteria may move only via
+        disputed fork. This is the intake rigor (1) and intent freeze (2) gate."""
+        if self.state["intent_frozen"]:
+            raise Blocked("intent already frozen")
+        if not self.state["criteria"]:
+            raise Blocked("cannot freeze an intent that still has no acceptance criteria")
+        self._append("control", {"ev": "intent_frozen"})
+        return self
+
+    # -- intake + validation helpers (1) ------------------------------------- #
+
+    @staticmethod
+    def validate_intent(intent, criteria, state_hook=None):
+        """Intake gate: before init, validate the requested magnet.
+
+        This is the place where an agent should stop and interview the request
+        rather than inventing criteria. It enforces the shape that must hold
+        before freeze_intent can succeed.
+        """
+        from exceptions import IntakeError
+        intent = req(intent, "--intent")
+        criteria = [str(c).strip() for c in (criteria or []) if str(c).strip()]
+        if not criteria:
+            raise IntakeError(
+                "intent has no criteria; the magnet has nothing to pull against. "
+                "Each criterion must be closeable by a command someone else could re-run."
+            )
+        if state_hook is not None and not callable(state_hook):
+            raise IntakeError("state_hook must be callable")
+        if any(len(c) < 4 for c in criteria):
+            raise IntakeError(
+                "a criterion shorter than 4 characters is unlikely to be verifiable: "
+                f"{criteria}"
+            )
+        return {"intent": intent, "criteria": criteria}
+
+    @transactional
+    def record_meta_fail(self, signature, failure_kind):
+        """Record a failed run signature for the meta want-rewind dataset (10)."""
+        signature = req(signature, "--signature")
+        failure_kind = req(failure_kind, "--failure-kind")
+        self._append("control", {"ev": "meta_record", "signature": signature, "failure_kind": failure_kind})
+        return self
+
+    @staticmethod
+    def decision_weight(kind, anchors, reversibility):
+        """Public alias for the derivation weight heuristic, surfaced on Ledger for
+        tests and CLI gating without importing derivation in consumers."""
+        from derivation import decision_weight as _dw
+        return _dw(kind, anchors, reversibility)
+
+    # -- spec integration: tickets -> criteria ------------------------------- #
+
+    @transactional
+    def import_tickets(self, directory):
+        """Map a to-tickets issue directory onto acceptance criteria.
+
+        The upstream workflow (/to-spec -> /to-tickets -> /implement-spec) closes
+        a ticket when it is merged. This ledger closes a run when every criterion
+        carries evidence. Importing tickets keeps the boundary visible: every
+        criterion remembers its ticket, so the report can name which ticket
+        *earned* its close and which was merely merged. A criterion no command
+        can close is refused here, at intake — not silently at close.
+        """
+        from tickets import parse_tickets
+
+        tickets = parse_tickets(directory)
+        self._append("control", {"ev": "tickets_imported", "tickets": tickets})
+        return self
 
     # -- entry A: the feedback loop ----------------------------------------- #
 
@@ -985,6 +1155,55 @@ class Ledger:
         )
         return self
 
+    # -- infra catalog + stub first-class (6) ------------------------------- #
+
+    CATALOG_SPECS = {
+        "postgres": {
+            "driver": "postgresql",
+            "placeholder": "postgresql://user:pass@host:5432/db",
+        },
+        "redis": {
+            "driver": "redis",
+            "placeholder": "redis://127.0.0.1:6379",
+        },
+        "sqlite": {
+            "driver": "sqlite",
+            "placeholder": "sqlite:///./dev.db",
+        },
+        "s3": {
+            "driver": "s3",
+            "placeholder": "s3://bucket/key",
+        },
+        "mail": {
+            "driver": "mail",
+            "placeholder": "smtp://localhost:1025",
+        },
+    }
+
+    @staticmethod
+    def resolve_catalog_spec(spec):
+        """Turn a known spec id into a concrete placeholder the run can provision against.
+
+        Unknown specs are accepted as-is: the catalog is guidance, not a cage.
+        """
+        if not isinstance(spec, str) or not spec.strip():
+            raise UsageError("spec must be a non-empty string")
+        return Ledger.CATALOG_SPECS.get(
+            spec.strip(), {"driver": spec.strip(), "placeholder": spec.strip()}
+        )
+
+    def provision_env_catalog(self, spec, output_var, command=None):
+        """Provision from catalog: record the spec and a placeholder command if none given.
+
+        This reduces the friction of turning a missing dependency into a runnable
+        environment without inventing a command from nothing. Not @transactional:
+        provision_env already takes the lock, and flock is not re-entrant across
+        separate open()s of the same file in one process.
+        """
+        spec_info = self.resolve_catalog_spec(spec)
+        if command is None:
+            command = f"echo {spec_info['placeholder']}"
+        return self.provision_env(spec_info["driver"], output_var, command)
     # -- infrastructure ----------------------------------------------------- #
 
     @transactional
@@ -1393,6 +1612,16 @@ class Ledger:
         """Delegate to pure derivation module, passing validate_infra as callback."""
         return derive_next_action(self.state, validate_infra_fn=self.validate_infra)
 
+    def auto_critique(self):
+        """The run's mechanical self-critique (10), derived from the same state as
+        the verdict: what a hostile reviewer would find, named first."""
+        return derive_auto_critique(self.state)
+
+    def pipeline_route(self):
+        """Lane routing for an upper pipeline (4): one word to route on, plus the
+        fallback lane when the primary one is blocked from outside the session."""
+        return derive_pipeline_route(self.state, validate_infra_fn=self.validate_infra)
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -1429,6 +1658,10 @@ def _build_parser():
     node = add("init", "create a ledger")
     node.add_argument("--intent", required=True)
     node.add_argument("--criterion", action="extend", nargs="+", default=[])
+    node.add_argument("--intake", action="store_true",
+                      help="validate the requested magnet without creating a ledger")
+
+    node = add("freeze-intent", "seal the right edge after init")
 
     node = add("declare-loop", "declare the feedback loop for an incident")
     node.add_argument("--incident", required=True)
@@ -1541,6 +1774,14 @@ def _build_parser():
     node.add_argument("--command", required=True,
                       help="the command that created the resource")
 
+    node = add("provision-env-catalog", "provision from the built-in spec catalog")
+    node.add_argument("--spec", required=True,
+                      help="catalog spec id (e.g. postgres, redis, sqlite, s3, mail)")
+    node.add_argument("--output-var", required=True,
+                      help="environment variable name holding the result")
+    node.add_argument("--command",
+                      help="if omitted, uses the catalog placeholder command")
+
     node = add("inject-build-context", "copy host build deps into isolated test dir")
     node.add_argument("--target", required=True,
                       help="directory receiving the injected context")
@@ -1586,7 +1827,11 @@ def _build_parser():
 
     add("status", "print the derived state as JSON")
     add("next-action", "print what the ledger requires next")
+    add("route", "print the pipeline lane and its fallback as JSON")
     add("close", "compute the final status and print the report")
+
+    node = add("import-tickets", "map a to-tickets issue directory onto criteria")
+    node.add_argument("--tickets", required=True, help="directory of ticket files")
     return parser
 
 
@@ -1598,6 +1843,9 @@ def main(argv=None):
     except Blocked as exc:
         print(f"BLOCKED: {exc}", file=sys.stderr)
         return BLOCKED
+    except IntakeError as exc:
+        print(f"INTAKE: {exc}", file=sys.stderr)
+        return USAGE
     except UsageError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return USAGE
@@ -1605,6 +1853,19 @@ def main(argv=None):
 
 def _dispatch(args):
     if args.subcommand == "init":
+        if getattr(args, "intake", False):
+            try:
+                validated = Ledger.validate_intent(args.intent, args.criterion)
+            except IntakeError as exc:
+                print(json.dumps({"shape_ok": False, "error": str(exc)}, indent=2))
+                return USAGE
+            print(json.dumps({
+                "intent": validated["intent"],
+                "criteria": validated["criteria"],
+                "shape_ok": True,
+                "next": "freeze the ledger with init, then drive the loop",
+            }, indent=2))
+            return OK
         Ledger.create(args.ledger, args.intent, args.criterion)
         print(f"initialised {args.ledger}")
         return OK
@@ -1674,6 +1935,8 @@ def _dispatch(args):
         ledger.record_risk(args.text, args.blocking)
     elif command == "provision-env":
         ledger.provision_env(args.spec, args.output_var, args.command)
+    elif command == "provision-env-catalog":
+        ledger.provision_env_catalog(args.spec, args.output_var, args.command)
     elif command == "inject-build-context":
         ledger.inject_build_context(
             args.target, args.source, args.artifacts, args.command,
@@ -1698,11 +1961,28 @@ def _dispatch(args):
     elif command == "next-action":
         print(json.dumps(ledger.next_action(), indent=2, sort_keys=True))
         return OK
+    elif command == "route":
+        print(json.dumps(ledger.pipeline_route(), indent=2, sort_keys=True))
+        return OK
+    elif command == "import-tickets":
+        ledger.import_tickets(args.tickets)
+        for t in ledger.state["tickets"]:
+            print(f"ticket {t['id']}: {t['title']} -> {len(t['criteria'])} criterion/criteria")
+        return OK
+    elif command == "freeze-intent":
+        ledger.freeze_intent()
+        print(f"intent frozen at {args.ledger}")
+        return OK
     elif command == "close":
         report = ledger.report()
         (ledger.root / "report.md").write_text(report, encoding="utf-8")
         print(report)
         status = ledger.outcome()[0]
+        if status != "REACHED":
+            ledger.record_meta_fail(
+                signature=f"run-{int(time.time())}",
+                failure_kind="not_reached",
+            )
         return OK if status == "REACHED" else BLOCKED
     else:  # pragma: no cover - argparse already constrains this
         raise UsageError(f"unknown command {command!r}")

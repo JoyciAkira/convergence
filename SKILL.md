@@ -96,6 +96,24 @@ needs to rebut it.
 Criteria are the unit of verification. Each one must be closeable by a command someone
 else could re-run. If you cannot name the command, the criterion is not a criterion yet.
 
+To check the shape before creating anything, run `init --intake`: it validates the
+magnet and prints the verdict as JSON **without writing a ledger**. An intent with no
+criteria, or with criteria too short to name a check, is refused at the door:
+
+```bash
+$CONVERGENCE init "$LEDGER" --intent "..." --criterion "..." --intake
+# → {"shape_ok": true, ...}  — nothing written; drop --intake to create
+```
+
+Once the magnet is right, seal it:
+
+```bash
+$CONVERGENCE freeze-intent "$LEDGER"
+```
+
+After the freeze, the only way to move the right edge is a disputed fork (below).
+Freezing is optional but cheap; a frozen run's report states when the intent was sealed.
+
 `record-evidence --criterion` must match the init-time text **exactly**. A near-miss used
 to open a second, uncancellable criterion and strand the run at `NOT REACHED` for reasons
 nobody could see; the machine now refuses it and tells you the closest real one. Copy the
@@ -698,6 +716,75 @@ again to resume normal operation.
 
 ---
 
+# Spec integration — tickets in, evidence out
+
+The upstream planning skills (`/to-spec` → `/to-tickets`) end in a directory of ticket
+files; `/implement-spec` ends in merged branches. Neither end is this ledger's notion of
+done. The bridge is `import-tickets`:
+
+```bash
+$CONVERGENCE import-tickets "$LEDGER" --tickets .scratch/<feature>/issues/
+```
+
+Both to-tickets shapes are read: the local template (`# <id>: <title>` with inline
+`**Field:**` lines) and the issue template used on real trackers (`## What to build` /
+`## Acceptance criteria` / `## Blocked by` sections). Ticket ids stay native — `01`,
+`42`, `ENG-123` — taken from the heading or the filename, and `Blocked by` accepts
+numbers (padding-insensitive: `1` finds `01`), native keys, full titles and tracker
+URLs, so a GitHub/Linear export imports unchanged.
+
+Every ticket's `- [ ]` acceptance criteria become ledger criteria, and the ticket
+boundary is kept as provenance. From there the two notions of completion diverge
+loudly:
+
+- **merged** is what the tracker says when the branch lands;
+- **earned** is what the report says when every criterion the ticket introduced carries
+  evidence.
+
+The report's `## Ticket provenance` section names which tickets earned their close and
+which were merely merged — an unproven criterion listed under its ticket. Since imported
+criteria sit in the flat list, `close` refuses while any of them is unverified: a ticket
+merged upstream without evidence **cannot** silently count as done here.
+
+Intake rules, enforced on import and again on replay:
+
+- a ticket with no acceptance criterion is refused — nobody can verify it;
+- a criterion shorter than 4 characters is refused — a check nobody can name is not a check;
+- the same criterion in two tickets is refused — provenance would be a guess;
+- a `Blocked by` edge to an unknown ticket is refused — a dangling edge means the export
+  was incomplete.
+
+Cite ticket criteria verbatim in `record-evidence --criterion`; they are ordinary
+criteria from import onward.
+
+To drive the whole loop automatically — import, work the frontier test-first, record
+evidence per criterion, close — use the `spec-implement` skill. It exists because
+`/implement-spec` (like its siblings) is human-triggered only (`disable-model-invocation:
+true`); `spec-implement` is the model-invocable counterpart, same task graph, with the
+ledger deciding what "done" means.
+
+---
+
+## Routing for upper pipelines
+
+A driving loop (autopilot, orchestrator, team runtime) should not parse prose to decide
+what to do next. `route` returns one routable word plus a fallback:
+
+```bash
+$CONVERGENCE route "$LEDGER"
+# → {"lane": "investigate", "because": "...", "action": {...},
+#    "fallback": {"lane": "verify", "because": "a parked gap is work, not a stop: ..."}}
+```
+
+Lanes: `investigate` (drive the hypothesis loop), `decide` (adjudicate forks), `unblock`
+(source missing facts / rebuild infrastructure), `verify` (collect evidence), `human`
+(escalate a decision outside delegated authority — e.g. a fork with no reversible
+option), `close`. The `fallback` names where to work when the primary lane is blocked
+from outside the session: an external fact, a human-only decision. A context gap is
+work, not a stop — the run is always routed somewhere it can move.
+
+---
+
 ## Composing with the rest of the library
 
 This skill does not replace them, and it is not a substitute for the planning front end.
@@ -711,6 +798,12 @@ Use it as the engine underneath whatever is already running:
 | diagnosis | `diagnosing-bugs` for feedback-loop construction; `deep-dive`/`trace` for parallel lanes |
 | verification | `graph-of-loops` review-only for the challenger pass; `live-debug-logs` for the evidence format |
 | final | `close` here emits the report `graph-of-loops` asks for |
+| spec | `import-tickets` maps `/to-tickets` output onto criteria; `## Ticket provenance` separates merged from earned |
+
+The report also carries `## Auto-critique`: the run names its own weaknesses first —
+searches that eliminated nothing, evidence without an `--output-ref`, verdict-less
+disputes, overruled dissent, narrow searches, intent drift — each row pointing at a
+record. A report that cannot say what is weak about itself is advocacy, not evidence.
 
 `graph-of-loops` remains the authority on the final status vocabulary and on materiality.
 This skill makes that vocabulary *computable* instead of a thing you promise yourself.
