@@ -1983,6 +1983,19 @@ def test_a_very_large_prompt_is_decomposed_whole():
     assert shape["criteria"][-1]["text"] == "criterion number 299 works"
 
 
+def test_two_unindented_lines_in_a_section_are_two_criteria_not_one():
+    """Section items fold only when indented: two consecutive plain lines are
+    two checks. (Body prose still folds and is sentence-split afterwards.)"""
+    shape = parse_prompt(
+        "# Billing\n\n## Requirements\n"
+        "Il totale deve coincidere con la somma delle righe.\n"
+        "Ensure the invoice PDF renders correctly.\n")
+    assert [c["text"] for c in shape["criteria"]] == [
+        "Il totale deve coincidere con la somma delle righe.",
+        "Ensure the invoice PDF renders correctly.",
+    ]
+
+
 def test_criteria_file_unwraps_bullets_checkboxes_and_continuations():
     items = criteria_from_text(
         "# Reqs\n\n- [ ] alpha check here\n* beta check there\n"
