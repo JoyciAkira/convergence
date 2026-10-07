@@ -1,6 +1,6 @@
 ---
 name: convergence
-description: "Run work to a defensible finish: an append-only ledger that enforces hypothesis elimination before any fix, a mandatory adversarial dispute before any mid-flight decision, classification instead of iteration caps when something stops converging, and three-tier evidence with derived final status. Use when the task is a project rather than a single change, when something fails repeatedly, when a genuine fork appears mid-implementation, or when the user demands no workarounds, no fake passes and no scope reduction."
+description: "Run work to a defensible finish: an append-only ledger that enforces hypothesis elimination before any fix, a mandatory adversarial dispute before any mid-flight decision, classification instead of iteration caps when something stops converging, and three-tier evidence with derived final status. Use for ANY project-level request, in any phrasing or language, however complex: one-line asks or very complex multi-goal briefs ("build X", "implement the spec", "fix this properly", "porta a termine questo progetto", "lavoro complesso", "senza scorciatoie", "niente pass finti"), when the task is a project rather than a single change, when something fails repeatedly, when a genuine fork appears mid-implementation, or when the user demands no workarounds, no fake passes and no scope reduction. Any prompt shape enters via init --prompt-file and is decomposed into intent + verifiable criteria."
 ---
 
 # Convergence
@@ -104,6 +104,32 @@ criteria, or with criteria too short to name a check, is refused at the door:
 $CONVERGENCE init "$LEDGER" --intent "..." --criterion "..." --intake
 # → {"shape_ok": true, ...}  — nothing written; drop --intake to create
 ```
+
+### Any prompt, any size
+
+The magnet accepts input in three interchangeable shapes — all of them can feed
+`--intake` first, and `--criterion`, `--criteria-file` and `--prompt-file` merge
+without duplicates:
+
+```bash
+# a raw prompt, however complex: sections, mixed lists, mixed languages
+$CONVERGENCE init "$LEDGER" --prompt-file brief.md        # or: --prompt-file -
+
+# huge or shell-hostile text: read from a file or stdin, no argv limits
+$CONVERGENCE init "$LEDGER" --intent-file intent.txt --criteria-file checks.txt
+```
+
+`--prompt-file` decomposes the prompt deterministically and reports the shape it
+found, with provenance for every extracted check: checkboxes and acceptance
+sections (`Acceptance criteria`, `Requirements`, `Criteri`, `Requisiti`, ...) become
+criteria; requirement sentences (`must`, `shall`, `deve`, `ensure ...`) become
+criteria wherever they appear — a negated one too, "must not double-charge" is a
+check; `Hypotheses`/`Risks` sections come back as candidate hypotheses for
+`open-hypothesis`; `Out of scope`/`Non-goals` become reported exclusions, never
+criteria. Task instructions ("build a REST API") are not checks and are refused
+with the question the asker must answer: what would prove it done? Nothing is
+truncated or invented — the decomposition is auditable at `--intake` before
+anything is written.
 
 Once the magnet is right, seal it:
 

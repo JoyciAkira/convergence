@@ -25,7 +25,16 @@ Three entry points, all funnelling into the same ledger:
 - **NON-CONVERGENCE** — repetition is *classified*, never counted. A defective loop and an
   unresolved hypothesis are directives with no cap. Only a named missing fact stops a run.
 
-## Working from a spec
+## Working from a prompt or a spec
+
+`init --prompt-file` takes a raw request — one line or a very complex multi-goal brief
+— and decomposes it into intent, acceptance criteria with provenance, candidate
+hypotheses and exclusions, deterministically and without truncation. Requirement
+sentences (`must`, `deve`, `ensure ...`) become checks wherever they appear; task
+instructions are refused with the question the asker must answer: what would prove it
+done? The shape is auditable at `--intake` before anything is written. Huge or
+shell-hostile text enters via `--intent-file` / `--criteria-file` (or `-` for stdin):
+no argv limits, multiline, unicode and BOM-prefixed files survive intact.
 
 `import-tickets` maps a `/to-tickets` issue directory onto acceptance criteria, keeping
 the ticket boundaries as provenance. A ticket *merged* upstream is not *earned* here:

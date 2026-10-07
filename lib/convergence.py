@@ -1656,8 +1656,19 @@ def _build_parser():
         return node
 
     node = add("init", "create a ledger")
-    node.add_argument("--intent", required=True)
+    source = node.add_mutually_exclusive_group(required=True)
+    source.add_argument("--intent", help="what outcome is actually wanted")
+    source.add_argument("--intent-file",
+                        help="read the intent from a file, or '-' for stdin: no argv "
+                             "size limit, multiline, unicode and quotes survive intact")
+    source.add_argument("--prompt-file",
+                        help="decompose a whole prompt (file, or '-' for stdin) into "
+                             "intent + acceptance criteria + candidate hypotheses; "
+                             "every prompt shape is accepted, the shape is reported")
     node.add_argument("--criterion", action="extend", nargs="+", default=[])
+    node.add_argument("--criteria-file",
+                      help="read criteria from a file, or '-' for stdin: bullets, "
+                           "checkboxes and plain lines each become one criterion")
     node.add_argument("--intake", action="store_true",
                       help="validate the requested magnet without creating a ledger")
 
@@ -1853,21 +1864,52 @@ def main(argv=None):
 
 def _dispatch(args):
     if args.subcommand == "init":
+        from prompt import criteria_from_text, load_text, parse_prompt
+
+        prompt_shape = None
+        if args.prompt_file:
+            prompt_shape = parse_prompt(load_text(args.prompt_file))
+            intent = prompt_shape["intent"]
+            criteria = [c["text"] for c in prompt_shape["criteria"]]
+        else:
+            intent = load_text(args.intent_file) if args.intent_file else args.intent
+            criteria = []
+        if args.criteria_file:
+            criteria += [c["text"] for c in criteria_from_text(load_text(args.criteria_file))]
+        criteria += list(args.criterion or [])
+        # merge sources without duplicates; order preserved, first spelling wins
+        seen = set()
+        criteria = [c for c in (str(c).strip() for c in criteria)
+                    if c and not (c.casefold() in seen or seen.add(c.casefold()))]
+
         if getattr(args, "intake", False):
             try:
-                validated = Ledger.validate_intent(args.intent, args.criterion)
+                validated = Ledger.validate_intent(intent, criteria)
             except IntakeError as exc:
                 print(json.dumps({"shape_ok": False, "error": str(exc)}, indent=2))
                 return USAGE
-            print(json.dumps({
+            shape = {
                 "intent": validated["intent"],
                 "criteria": validated["criteria"],
                 "shape_ok": True,
                 "next": "freeze the ledger with init, then drive the loop",
-            }, indent=2))
+            }
+            if prompt_shape is not None:
+                shape["criteria_provenance"] = prompt_shape["criteria"]
+                shape["hypotheses"] = prompt_shape["hypotheses"]
+                shape["exclusions"] = prompt_shape["exclusions"]
+            print(json.dumps(shape, indent=2))
             return OK
-        Ledger.create(args.ledger, args.intent, args.criterion)
-        print(f"initialised {args.ledger}")
+        Ledger.create(args.ledger, intent, criteria)
+        if prompt_shape is not None:
+            print(json.dumps({"created": args.ledger, "shape_ok": True,
+                              "intent": prompt_shape["intent"],
+                              "criteria": [c["text"] for c in prompt_shape["criteria"]],
+                              "criteria_provenance": prompt_shape["criteria"],
+                              "hypotheses": prompt_shape["hypotheses"],
+                              "exclusions": prompt_shape["exclusions"]}, indent=2))
+        else:
+            print(f"initialised {args.ledger}")
         return OK
 
     ledger = Ledger(args.ledger)

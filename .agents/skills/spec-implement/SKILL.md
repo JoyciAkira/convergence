@@ -1,6 +1,6 @@
 ---
 name: spec-implement
-description: Drive a spec's tickets to a proven close on the convergence ledger: import tickets as acceptance criteria, implement the frontier test-first, record evidence per criterion, and let `close` decide. Use when the user wants to execute a /to-spec or /to-tickets breakdown, says "implement the spec", "work the tickets", or wants the manual-only implement-spec flow driven automatically.
+description: Drive any request to a proven close on the convergence ledger — a /to-spec or /to-tickets breakdown, a tracker export, or a raw prompt of any size or complexity. Imports tickets or decomposes the prompt into acceptance criteria, implements the frontier test-first, records evidence per criterion, and lets `close` decide. Use for ANY implementation request in any phrasing or language: "implement the spec", "work the tickets", "build this properly", "porta a termine questo progetto", "fai il progetto", "senza scorciatoie", or a complex multi-goal brief — whenever the user wants something built and carried to a proven finish.
 ---
 
 # Spec Implement
@@ -16,16 +16,23 @@ convergence ledger decides when the run may call itself finished.
 - A ticket directory: `.scratch/<feature-slug>/issues/*.md` from `/to-tickets`,
   or an export from a real tracker (native ids like `ENG-123`, issue-template
   sections — `import-tickets` accepts both).
+- Or a raw prompt, if there is no breakdown yet. `init --prompt-file <file|->`
+  decomposes it — intent, acceptance criteria with provenance, candidate
+  hypotheses, exclusions — so even a very complex multi-goal brief enters the
+  ledger without a planning phase. Use `--intake` first to audit the shape.
 - A ledger path. If none exists, create one: `init` with the spec's outcome as
-  `--intent` and its observable claims as `--criterion`, then `freeze-intent`.
+  `--intent` and its observable claims as `--criterion` (or `--intent-file` /
+  `--criteria-file` for large text), then `freeze-intent`.
 
 ## Steps
 
-1. **Import.** `convergence.py import-tickets <ledger> --tickets <dir>`. Every
-   ticket's `- [ ]` acceptance criteria become ledger criteria; the ticket
-   boundary is kept as provenance. Refusals here (criterionless tickets,
-   duplicated criteria, dangling `Blocked by` edges) are intake errors — fix
-   the tickets, do not work around them.
+1. **Import or decompose.** Tickets:
+   `convergence.py import-tickets <ledger> --tickets <dir>`. Every ticket's
+   `- [ ]` acceptance criteria become ledger criteria; the ticket boundary is
+   kept as provenance. Raw prompt: `convergence.py init <ledger>
+   --prompt-file <file>`. Refusals at either door (criterionless tickets,
+   duplicated criteria, dangling `Blocked by` edges, a prompt that states only
+   tasks) are intake errors — fix the input, do not work around them.
 
 2. **Route.** `convergence.py route <ledger>` before every grab. It returns the
    lane (`investigate` / `decide` / `unblock` / `verify` / `human` / `close`)

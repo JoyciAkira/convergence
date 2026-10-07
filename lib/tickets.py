@@ -107,7 +107,7 @@ def _identity(path: Path) -> tuple[str | None, str]:
     tracker's own — nothing is renumbered here.
     """
     path = Path(path)
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
         stripped = line.strip()
         m = TICKET_HEADING_RE.match(stripped)
         if m:
@@ -144,7 +144,7 @@ def parse_ticket_file(path: Path, known_ids: set[str] | None = None,
     section = None
     section_lines: dict[str, list[str]] = {}
 
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
         stripped = line.strip()
         lowered = stripped.lower()
         sec = SECTION_RE.match(stripped)

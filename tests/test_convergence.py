@@ -1878,3 +1878,215 @@ def test_provenance_formats_native_ids(tmp_path):
     led.import_tickets(tickets)
     prov = led.report().split("## Ticket provenance")[1].split("\n## ")[0]
     assert "ticket ENG-7" in prov
+
+
+# --------------------------------------------------------------------------- #
+# prompt intake: every prompt shape, no argv limits, nothing lost
+# --------------------------------------------------------------------------- #
+
+from prompt import criteria_from_text, parse_prompt  # noqa: E402
+
+
+def test_a_complex_multisection_prompt_decomposes_without_loss():
+    """A very complex prompt: sections, mixed list syntax, a Goal heading,
+    requirement sentences after the last section. Every stated check lands as a
+    criterion with provenance; specs and exclusions are reported, not promoted."""
+    prompt = """# Payments retry engine
+
+## Goal
+ship a retry engine that never drops a payment
+
+## Acceptance criteria
+- [ ] failed payments retry with exponential backoff
+- [x] retries are capped at five attempts
+1. a dead payment raises an alert
+
+## Risks
+- the payment provider may rate-limit us
+
+## Out of scope
+- refunds
+
+Retries must not double-charge a card.
+Ensure the retry state survives a restart.
+"""
+    shape = parse_prompt(prompt)
+    assert shape["intent"] == "ship a retry engine that never drops a payment"
+    texts = [c["text"] for c in shape["criteria"]]
+    assert texts == [
+        "failed payments retry with exponential backoff",
+        "retries are capped at five attempts",
+        "a dead payment raises an alert",
+        "Retries must not double-charge a card.",
+        "the retry state survives a restart.",
+    ]
+    # provenance says which rule extracted each check
+    assert shape["criteria"][0]["source"] == "section:Acceptance criteria"
+    assert shape["criteria"][3]["source"] == "requirement-sentence"
+    # hypotheses are candidates for open-hypothesis, not criteria
+    assert [h["text"] for h in shape["hypotheses"]] == [
+        "the payment provider may rate-limit us"]
+    assert shape["exclusions"] == ["refunds"]
+
+
+def test_goal_marker_forms_are_all_recognised():
+    assert parse_prompt("## Goal: ship the parser\n\n- [ ] handles CRLF\n")["intent"] \
+        == "ship the parser"
+    assert parse_prompt("Goal: ship the parser\n\nThe parser must handle BOM.\n")["intent"] \
+        == "ship the parser"
+    assert parse_prompt("## Obiettivo\nspedire il parser\n\n- [ ] il parser gira\n")["intent"] \
+        == "spedire il parser"
+
+
+def test_negated_requirements_are_criteria_not_exclusions():
+    shape = parse_prompt("Ship it.\n\nThe gateway must not leak the API key.")
+    assert "The gateway must not leak the API key." in [c["text"] for c in shape["criteria"]]
+
+
+def test_an_imperative_only_prompt_is_refused_at_intake():
+    """Task instructions are not checks; the refusal names the missing question."""
+    with pytest.raises(IntakeError, match="names no check"):
+        parse_prompt("Build a REST API. Make it fast.")
+
+
+def test_a_one_sentence_prompt_is_both_intent_and_criterion():
+    shape = parse_prompt("The parser handles BOM-prefixed files.")
+    assert shape["intent"] == "The parser handles BOM-prefixed files."
+    assert [c["text"] for c in shape["criteria"]] == ["The parser handles BOM-prefixed files."]
+
+
+def test_bare_bullets_promote_to_criteria():
+    shape = parse_prompt("- handles CRLF\n- rejects malformed input with a clear error")
+    assert [c["text"] for c in shape["criteria"]] == [
+        "handles CRLF", "rejects malformed input with a clear error"]
+
+
+def test_duplicated_criteria_collapse_but_others_survive():
+    shape = parse_prompt(
+        "# Ship the auth flow\n\n## Acceptance criteria\n- [ ] the login works\n"
+        "- [ ] the login works\n- [ ] the logout works\n")
+    assert [c["text"] for c in shape["criteria"]] == ["the login works", "the logout works"]
+
+
+def test_an_unnameable_criterion_is_refused_not_silently_kept():
+    with pytest.raises(IntakeError, match="shorter than 4"):
+        parse_prompt("# Ship it\n\n## Acceptance criteria\n- [ ] ok\n")
+
+
+def test_a_very_large_prompt_is_decomposed_whole():
+    """300 criteria, no truncation: prompts are read whole from a file."""
+    prompt = "# Big\n\n## Acceptance criteria\n" + "\n".join(
+        f"- [ ] criterion number {i:03d} works" for i in range(300))
+    shape = parse_prompt(prompt)
+    assert len(shape["criteria"]) == 300
+    assert shape["criteria"][0]["text"] == "criterion number 000 works"
+    assert shape["criteria"][-1]["text"] == "criterion number 299 works"
+
+
+def test_criteria_file_unwraps_bullets_checkboxes_and_continuations():
+    items = criteria_from_text(
+        "# Reqs\n\n- [ ] alpha check here\n* beta check there\n"
+        "gamma check continues\n  on the next line\n")
+    assert [c["text"] for c in items] == [
+        "alpha check here", "beta check there", "gamma check continues on the next line"]
+
+
+def test_init_from_prompt_file_creates_the_whole_magnet(tmp_path):
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("## Goal: ship the parser\n\n## Acceptance criteria\n"
+                           "- [ ] handles CRLF\n- [ ] rejects malformed\n")
+    path = tmp_path / "L"
+    out = run_cli("init", str(path), "--prompt-file", str(prompt_file))
+    assert out.returncode == 0, out.stderr
+    shape = json.loads(out.stdout)
+    assert shape["shape_ok"] is True
+    assert shape["intent"] == "ship the parser"
+    state = Ledger(path).state
+    assert state["criteria"] == ["handles CRLF", "rejects malformed"]
+
+
+def test_prompt_criteria_still_gate_the_close(tmp_path):
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("## Goal: ship the parser\n\n## Acceptance criteria\n"
+                           "- [ ] handles CRLF\n")
+    path = tmp_path / "L"
+    run_cli("init", str(path), "--prompt-file", str(prompt_file))
+    assert run_cli("close", str(path)).returncode == 3
+    run_cli("record-evidence", str(path), "--criterion", "handles CRLF",
+            "--command", "pytest -k crlf", "--tier", "executed_here",
+            "--expected-source", "literal")
+    assert run_cli("close", str(path)).returncode == 0
+
+
+def test_intake_mode_previews_the_decomposition_and_writes_nothing(tmp_path):
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("## Goal: ship it\n\n## Acceptance criteria\n- [ ] the thing works\n\n"
+                           "## Risks\n- flaky network\n")
+    path = tmp_path / "L"
+    out = run_cli("init", str(path), "--prompt-file", str(prompt_file), "--intake")
+    assert out.returncode == 0, out.stderr
+    shape = json.loads(out.stdout)
+    assert shape["shape_ok"] is True
+    assert shape["criteria_provenance"][0]["text"] == "the thing works"
+    assert shape["hypotheses"][0]["text"] == "flaky network"
+    assert not path.exists()
+
+
+def test_intent_file_accepts_a_huge_multiline_unicode_intent(tmp_path):
+    """No argv limits: a 100 KB multiline intent with quotes and unicode
+    round-trips through init untouched."""
+    intent = "ship the parser — “quoted”\nsecond line\n" + "x" * 100_000
+    intent_file = tmp_path / "intent.txt"
+    intent_file.write_text(intent)
+    path = tmp_path / "L"
+    out = run_cli("init", str(path), "--intent-file", str(intent_file),
+                  "--criterion", "works")
+    assert out.returncode == 0, out.stderr
+    assert Ledger(path).state["intent"] == intent
+
+
+def test_criteria_file_merges_with_flag_criteria_without_duplicates(tmp_path):
+    criteria_file = tmp_path / "criteria.txt"
+    criteria_file.write_text("- handles CRLF\nhandles CRLF\nrejects malformed\n")
+    path = tmp_path / "L"
+    out = run_cli("init", str(path), "--intent", "ship it",
+                  "--criteria-file", str(criteria_file),
+                  "--criterion", "rejects malformed", "e2e passes")
+    assert out.returncode == 0, out.stderr
+    assert Ledger(path).state["criteria"] == ["handles CRLF", "rejects malformed", "e2e passes"]
+
+
+def test_intent_sources_are_mutually_exclusive(tmp_path):
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("## Acceptance criteria\n- [ ] the thing works\n")
+    out = run_cli("init", str(tmp_path / "L"), "--intent", "x",
+                  "--prompt-file", str(prompt_file))
+    assert out.returncode == 2
+    out = run_cli("init", str(tmp_path / "L"))
+    assert out.returncode == 2
+
+
+def test_prompt_file_reads_stdin_with_dash(tmp_path):
+    prompt = "## Goal: ship it\n\n## Acceptance criteria\n- [ ] the thing works\n"
+    out = subprocess.run(
+        [sys.executable, str(ROOT / "lib" / "convergence.py"),
+         "init", str(tmp_path / "L"), "--prompt-file", "-"],
+        capture_output=True, text=True, input=prompt, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert Ledger(tmp_path / "L").state["criteria"] == ["the thing works"]
+
+
+def test_prompt_file_missing_is_a_usage_error(tmp_path):
+    out = run_cli("init", str(tmp_path / "L"), "--prompt-file", str(tmp_path / "nope.md"))
+    assert out.returncode == 2
+    assert "ERROR" in out.stderr
+
+
+def test_bom_prefixed_prompt_imports_without_smuggling_the_bom(tmp_path):
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("\ufeff## Goal: ship it\n\n## Acceptance criteria\n"
+                           "- [ ] the thing works\n", encoding="utf-8")
+    path = tmp_path / "L"
+    out = run_cli("init", str(path), "--prompt-file", str(prompt_file))
+    assert out.returncode == 0, out.stderr
+    assert Ledger(path).state["intent"] == "ship it"
