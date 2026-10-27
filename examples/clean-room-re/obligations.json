@@ -1,0 +1,21 @@
+{
+  "target": "libnative_crypto.so",
+  "reconstruction_obligations": [
+    {
+      "id": "OBL-KEYEXP",
+      "title": "Key Expansion Parity",
+      "category": "structural",
+      "criteria": [
+        "aes_expand_key produces 11 round keys matching FIPS-197"
+      ]
+    },
+    {
+      "id": "OBL-BLOCK",
+      "title": "Block Decryption Differential Parity",
+      "category": "behavioral",
+      "criteria": [
+        "aes_decrypt_block matches binary oracle outputs across 1000 test vectors"
+      ]
+    }
+  ]
+}

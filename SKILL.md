@@ -1,5 +1,20 @@
 ---
 name: convergence
+triggers:
+  - porta a termine
+  - senza scorciatoie
+  - niente pass finti
+  - fix this properly
+  - implement the spec
+  - no workarounds
+  - no fake passes
+  - red loop
+  - mid-flight fork
+  - reverse engineer
+  - clean room
+  - reconstruction obligations
+  - rea tools
+argument-hint: "[--prompt-file <brief>] [--intent \"<outcome>\" --criterion \"<check>\" ...]"
 description: "Run work to a defensible finish: an append-only ledger that enforces hypothesis elimination before any fix, a mandatory adversarial dispute before any mid-flight decision, classification instead of iteration caps when something stops converging, and three-tier evidence with derived final status. Use for ANY project-level request, in any phrasing or language, however complex: one-line asks or very complex multi-goal briefs ("build X", "implement the spec", "fix this properly", "porta a termine questo progetto", "lavoro complesso", "senza scorciatoie", "niente pass finti"), when the task is a project rather than a single change, when something fails repeatedly, when a genuine fork appears mid-implementation, or when the user demands no workarounds, no fake passes and no scope reduction. Any prompt shape enters via init --prompt-file and is decomposed into intent + verifiable criteria."
 ---
 
@@ -9,6 +24,21 @@ description: "Run work to a defensible finish: an append-only ledger that enforc
 you are allowed to have done it.** If the two disagree, the machine wins — it exits `3`
 and prints the gate that refused you. Do not look for a way around it, because there is
 none, and that is the point.
+
+## When to activate / when not to
+
+Activate for project-level work: multi-step briefs, "porta a termine",
+"senza scorciatoie", repeated failures, genuine mid-flight forks, or any
+demand for no workarounds and no scope reduction. Prefer `init --intake`
+first on vague prompts; if the intent has no re-runnable check, ask what
+would prove it done before creating the ledger.
+
+Do NOT activate for a single trivial change (typo, one-line rename with an
+obvious check): the ledger would be theatre there. Use the minimal honest
+sequence only when a check actually went red.
+
+Glossary: [CONTEXT.md](CONTEXT.md). Minimal runnable example:
+[examples/minimal-narrow/run.sh](examples/minimal-narrow/run.sh).
 
 ## The magnet
 
@@ -75,6 +105,8 @@ rather than retrying the identical call.
 `status` prints the whole derived state as a **flat JSON object at the top level** — no
 `state` wrapper. It is meant for scripts and for `grep`; do not paste it into a prompt on a
 large run, it grows with the ledger. Use `next-action` and `close` when you want to read.
+Paging: `status --section criteria --limit 20`, or
+`status --criterion "handles CRLF"` to inspect one check and its evidence.
 
 The ledger lives inside the working repo because that is where the evidence lives. Add
 `.omc/convergence/` to `.gitignore` unless the audit trail is meant to ship with the
@@ -112,7 +144,8 @@ The magnet accepts input in three interchangeable shapes — all of them can fee
 without duplicates:
 
 ```bash
-# a raw prompt, however complex: sections, mixed lists, mixed languages
+# a raw prompt, however complex: directly as string or from a file
+$CONVERGENCE init "$LEDGER" --prompt "deploy the app with auth and e2e checks"
 $CONVERGENCE init "$LEDGER" --prompt-file brief.md        # or: --prompt-file -
 
 # huge or shell-hostile text: read from a file or stdin, no argv limits
@@ -139,6 +172,36 @@ $CONVERGENCE freeze-intent "$LEDGER"
 
 After the freeze, the only way to move the right edge is a disputed fork (below).
 Freezing is optional but cheap; a frozen run's report states when the intent was sealed.
+
+Ambiguity gate (recommended before freeze): run `init --intake`. It returns
+`needs_interview` plus one pointed `question` per vague edge — a missing or
+one-word intent, a criterion phrased as a bare task ("build a REST API"),
+or a criterion phrased as doubt ("should it support BOM?"). Answer each
+question, re-run `--intake` until `needs_interview` is false, and only then
+create the ledger and freeze. A frozen misunderstanding still delivers the
+wrong thing.
+
+Intake critic (runs on every init, deterministically): three red flags over the
+criteria, each naming the answer that closes it.
+
+- `restates_intent` — a long criterion (>= 6 content words) that adds nothing to
+  the intent's own words. It passes by construction and **refuses the init**.
+  A short criterion inside the intent is a legitimate narrow check and is never
+  flagged.
+- `unbounded_quality` — "fast", "robust", "correct" with no number, threshold or
+  budget anywhere in the criterion. A question, not a refusal — but the criterion
+  is now **flagged in the ledger**, and evidence against a flagged criterion is
+  refused unless `--expected-source` is passed explicitly. A vague criterion may
+  still be verified; it may no longer be verified by an implicit oracle.
+- `no_oracle` — neither a bound nor an observable verb ("works", "is handled"):
+  same consequence as `unbounded_quality`.
+
+The critic never invents wording; a flagged criterion is fixed by answering its
+question, or by moving the criterion through a disputed fork to wording a command
+can check.
+
+Human escalation one-pager (for `decide --by human`): three options, tradeoff,
+recommendation, cost of not deciding. Then stop that path and keep the run.
 
 `record-evidence --criterion` must match the init-time text **exactly**. A near-miss used
 to open a second, uncancellable criterion and strand the run at `NOT REACHED` for reasons
@@ -250,10 +313,33 @@ That disclosure outlives the run; the *verdict* is unaffected. Use `narrow` when
 defect is fully reproduced and you can say in one sentence why the mechanism is not in
 doubt. Use `full` the moment that sentence would be a guess.
 
-The minimal honest sequence for a small change is therefore four commands: `init`,
+The minimal honest sequence for a small change is therefore: `init`,
 `declare-loop`, `run-loop`, then `open-hypothesis` → `refute`/`survive` → `begin-fix
 --search narrow` → `record-evidence` → `close`. Never fewer: a run with no ledger has no
 machine, and no machine means no gate.
+
+**One command, same gates.** Typing those eight commands for a one-line null guard is
+ceremony, and ceremony gets skipped — which is how the theatre starts. `one-shot` batches
+the whole narrow sequence while delegating every step to the same gate-checked methods:
+the loop must still have gone red, the hypothesis must still be settled, the disclosure
+is still written:
+
+```bash
+$CONVERGENCE one-shot "$LEDGER" --incident INC-1 \
+  --loop-command "pytest -k null" --symptom "NoneType crash on empty input" \
+  --red-observed true \
+  --claim "the parser does not guard None" \
+  --prediction "adding the guard turns the loop green" \
+  --probe "apply guard, rerun" --observed "green: 1 passed" \
+  --fix-note "add the null guard" \
+  --criterion "null input returns an empty parse" \
+  --evidence-command "pytest -k null"
+```
+
+`--red-observed` accepts only `true`: the one-shot path exists because the loop actually
+went red on the exact symptom, not as a shortcut around that fact. Each step is
+idempotent, so an interrupted batch resumes instead of wedging. The default `--search`
+is `narrow` — pass `--search full` the moment the mechanism could be in doubt.
 
 ---
 
@@ -439,6 +525,38 @@ Nothing but an unobtainable fact parks anything, and a park is not a wall.
 
 ---
 
+# Entry D — exploratory runs: candidates in, selection out
+
+Trigger: the task does not yet have a known solution shape. The ledger does not
+generate ideas — that is `arena`, parallel sub-agents, or the author. What the
+ledger does is make the *choice* honest: an exploratory run (`init --exploratory`)
+may not begin a fix until candidate solutions exist and one has been selected.
+
+```bash
+$CONVERGENCE init "$LEDGER" --intent "..." --criterion "..." --exploratory
+# ... run the exploration (arena --quick, parallel agents, manual drafts) ...
+$CONVERGENCE record-candidates "$LEDGER" --run-id r7 --source arena --count 16 \
+  --file .arena/r7/winner.md
+$CONVERGENCE select-candidate "$LEDGER" --run-id r7 --id a017 \
+  --by disputed --method "rubric scores after review" --fork F1
+```
+
+Selection has two weights, like disputes:
+
+- `--by disputed` — a separate context contested the choice on a recorded fork
+  before it landed. The gate checks the dispute exists; a "disputed" selection
+  without one is refused.
+- `--by author` — never blocks, but the report carries it as a disclosure:
+  *unopposed self-selection*. Picking your own candidate in silence is exactly
+  the laundering this ledger exists to prevent; naming it is the minimum price
+  of still doing it.
+
+`next-action` routes an exploratory run to `record-candidates` / `select-candidate`,
+`route` assigns both the `explore` lane, and a re-selection of an already-selected
+run is refused — that move needs a disputed fork, not a quieter moment.
+
+---
+
 # Evidence
 
 Three tiers, and no claim is a claim until a **named, re-runnable command** produced
@@ -467,6 +585,8 @@ somewhere other than the implementation:
 | `spec` | an acceptance criterion in the spec or a PRD story |
 | `worked_example` | a hand-worked case, e.g. a window of 3 with limit 2 admits 2 then denies |
 | `independent_oracle` | computed by something that is not the code under test: a second implementation, a database constraint, a third-party client |
+| `binary_oracle` | differential testing against native binary ground truth (running the original binary or export under QEMU, Wine, or native OS) |
+| `rea_evidence` | immutable cryptographic Evidence ID from an authenticated REA / Ghidra analysis bundle (e.g. `rea://bundle/EV-01`) |
 | `code` | **refused** — recomputing the expected value the way the code does makes the check pass by construction and lets it never disagree with the bug |
 
 When two labels both fit, ask what would still hold if the code were wrong. If the answer
@@ -507,6 +627,17 @@ You may not announce a status the machine did not print, and you may not describ
 
 ---
 
+## Ledger maintenance
+
+`LEDGER_VERSION = 2` (see `lib/convergence.py`). Replays refuse corrupt lines
+instead of guessing; `compact()` archives the originals, writes one snapshot,
+and proves the compacted ledger replays to the same state, restoring the
+originals on any divergence. Locks are portable (`fcntl` on POSIX, `msvcrt` on
+Windows) so two agents racing one ledger still yield exactly one winner.
+
+`import-tickets` is idempotent: re-importing the same directory skips identical
+tickets and refuses only genuinely conflicting ones.
+
 ## What the machine refuses
 
 Read this as a list of arguments you cannot win. Each is a test.
@@ -539,6 +670,12 @@ Read this as a list of arguments you cannot win. Each is a test.
 - a criterion revision naming an edge that does not exist
 - a criterion revision decided without a dispute, or without naming what it invalidates
 - an edge moved to something already on the list
+- a fix in an exploratory run while no candidate solution is selected
+- a `disputed` candidate selection with no recorded dispute on the named fork
+- a second selection for a candidate run that already has one
+- evidence against an intake-critic-flagged criterion with no explicit
+  `--expected-source`
+- an init whose long criterion restates the intent's own words
 
 ## Anti-patterns
 
@@ -602,7 +739,9 @@ reflect missing context, not bad output.
 ## Store secrets for secure criterion verification
 
 API keys and tokens must never touch the ledger or the transcript. Store them once
-and reference by name in evidence commands:
+and reference by name in evidence commands. Names are `UPPER_SNAKE` and the
+retrieval `--command` must reference the name (e.g. `$LLM_API_KEY`); pasting
+the value is refused:
 
 ```bash
 $CONVERGENCE store-secret "$LEDGER" \
@@ -789,6 +928,40 @@ evidence per criterion, close — use the `spec-implement` skill. It exists beca
 true`); `spec-implement` is the model-invocable counterpart, same task graph, with the
 ledger deciding what "done" means.
 
+
+# Reverse engineering — obligations in, proven parity out
+
+Clean-room reimplementation, binary patch verification, and protocol reverse
+engineering start with opaque targets. Tools like REA (`rea.tools`), Ghidra, Hopper,
+and Rizin extract structural, CFG, and behavioral obligations into a
+`ReconstructionObligationLedger`. The bridge into convergence is `import-obligations`:
+
+```bash
+$CONVERGENCE import-obligations "$LEDGER" --obligations .omc/rea-evidence-bundle.json
+```
+
+Both JSON manifests (REA bundles, Ghidra export dictionaries, lists of obligations)
+and markdown obligation specs (`# <id>: <title>` with `**target:** <bin>` and `- [ ]`
+criteria) are ingested. Every obligation's criteria become ledger criteria, and the
+obligation boundary is preserved as provenance.
+
+The report's `## Reconstruction obligation provenance` section names which reverse
+engineering obligations earned their close on evidence and which remain unproven.
+Since imported criteria sit in the flat list, `close` refuses while any obligation
+criterion lacks verified evidence.
+
+Intake rules:
+- an obligation with no criteria is refused;
+- a criterion shorter than 4 characters is refused;
+- duplicate criteria across obligations are refused;
+- duplicate obligation IDs within the batch are refused.
+
+Evidence for reverse-engineered criteria uses:
+- `--expected-source binary_oracle`: differential test harness asserting parity with
+  the original binary running in an emulator or native runner.
+- `--expected-source rea_evidence`: referencing an immutable analysis artifact
+  with `--output-ref "rea://bundle/EV-123"`.
+
 ---
 
 ## Routing for upper pipelines
@@ -820,6 +993,7 @@ Use it as the engine underneath whatever is already running:
 |---|---|
 | intent | `deep-interview` for the ambiguity gate, `grilling` for a design tree |
 | plan | `ralplan` for Planner/Architect/Critic consensus; `codebase-design` DESIGN-IT-TWICE for interfaces |
+| explore | `arena --quick` or parallel sub-agents generate candidates; `record-candidates`/`select-candidate` make the choice auditable (**Entry D**) |
 | execution | `ralph` for story tracking; **Entry B here fires first** |
 | diagnosis | `diagnosing-bugs` for feedback-loop construction; `deep-dive`/`trace` for parallel lanes |
 | verification | `graph-of-loops` review-only for the challenger pass; `live-debug-logs` for the evidence format |

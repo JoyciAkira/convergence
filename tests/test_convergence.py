@@ -2103,3 +2103,441 @@ def test_bom_prefixed_prompt_imports_without_smuggling_the_bom(tmp_path):
     out = run_cli("init", str(path), "--prompt-file", str(prompt_file))
     assert out.returncode == 0, out.stderr
     assert Ledger(path).state["intent"] == "ship it"
+# --------------------------------------------------------------------------- #
+# reverse engineering integration: obligations, REA evidence, and binary oracle
+# --------------------------------------------------------------------------- #
+
+from obligations import parse_obligations
+
+
+def write_obligation_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def write_obligation_md(path, ident, title, criteria, target=None, category=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"# {ident}: {title}"]
+    if target:
+        lines.append(f"**target:** {target}")
+    if category:
+        lines.append(f"**category:** {category}")
+    lines.extend(["", "## Acceptance criteria"])
+    for c in criteria:
+        lines.append(f"- [ ] {c}")
+    lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def test_expected_sources_includes_binary_oracle_and_rea_evidence(tmp_path):
+    led = Ledger.create(tmp_path / "L", "re target", ["crc matches", "cfg matches", "tautology test"])
+    # binary_oracle is accepted
+    led.record_evidence("crc matches", "qemu-x86_64 ./harness", "executed_here",
+                        expected_source="binary_oracle", output_ref="traces/crc.log")
+    # rea_evidence is accepted
+    led.record_evidence("cfg matches", "rea_trace_native_values --addr 0x4010", "executed_here",
+                        expected_source="rea_evidence", output_ref="rea://bundle/EV-1")
+    # code is refused
+    with pytest.raises(Blocked, match="expected_source=code"):
+        led.record_evidence("tautology test", "pytest", "executed_here",
+                            expected_source="code")
+
+
+def test_catalog_specs_include_re_toolchain(tmp_path):
+    led = Ledger.create(tmp_path / "L", "reverse binary", ["re done"])
+    for spec in ("ghidra", "rizin", "radare2", "frida", "qemu"):
+        resolved = led.resolve_catalog_spec(spec)
+        assert resolved["driver"] == spec
+        assert spec in resolved["placeholder"] or ("r2" in resolved["placeholder"] and spec == "radare2")
+
+
+def test_import_obligations_maps_criteria_and_keeps_provenance(tmp_path):
+    bundle_file = tmp_path / "bundle.json"
+    write_obligation_json(bundle_file, {
+        "target": "libnative.so",
+        "obligations": [
+            {
+                "id": "OBL-01",
+                "title": "AES Key Schedule Parity",
+                "category": "structural",
+                "criteria": [
+                    "AES_set_encrypt_key expands 128-bit key",
+                    "Round keys match FIPS-197 standard"
+                ]
+            },
+            {
+                "id": "OBL-02",
+                "title": "Token Dispatch Reachability",
+                "criteria": [
+                    "dispatch_token returns 0 on invalid MAC"
+                ]
+            }
+        ]
+    })
+    led = Ledger.create(tmp_path / "L", "clean room reimplementation", ["clean-room ships"])
+    led.import_obligations(bundle_file)
+    assert [o["id"] for o in led.state["obligations"]] == ["OBL-01", "OBL-02"]
+    assert "AES_set_encrypt_key expands 128-bit key" in led.state["criteria"]
+    assert "Round keys match FIPS-197 standard" in led.state["criteria"]
+    assert "dispatch_token returns 0 on invalid MAC" in led.state["criteria"]
+
+    # Re-import identical is idempotent
+    led.import_obligations(bundle_file)
+    assert len(led.state["obligations"]) == 2
+
+    # Ambiguous re-import with different criteria is refused
+    conflict_file = tmp_path / "conflict.json"
+    write_obligation_json(conflict_file, {
+        "obligations": [{"id": "OBL-01", "title": "Changed Title", "criteria": ["different check here"]}]
+    })
+    with pytest.raises(UsageError, match="already imported with different content"):
+        led.import_obligations(conflict_file)
+
+
+def test_import_obligations_markdown_and_directory(tmp_path):
+    obl_dir = tmp_path / "obligations"
+    write_obligation_md(obl_dir / "01.md", "OBL-1", "Parser Header",
+                        ["header size is 64 bytes"], target="firmware.bin", category="struct")
+    write_obligation_json(obl_dir / "02.json", {
+        "obligations": [{
+            "id": "OBL-2",
+            "title": "Checksum Calculation",
+            "criteria": ["checksum uses crc16-ccitt"]
+        }]
+    })
+
+    led = Ledger.create(tmp_path / "L", "re firmware", ["firmware verified"])
+    led.import_obligations(obl_dir)
+    assert len(led.state["obligations"]) == 2
+    assert "header size is 64 bytes" in led.state["criteria"]
+    assert "checksum uses crc16-ccitt" in led.state["criteria"]
+
+
+def test_import_obligations_intake_validation_rules(tmp_path):
+    led = Ledger.create(tmp_path / "L", "re target", ["target verified"])
+
+    # Empty obligations
+    empty_file = tmp_path / "empty.json"
+    write_obligation_json(empty_file, {"obligations": []})
+    with pytest.raises(IntakeError, match="no obligations found"):
+        led.import_obligations(empty_file)
+
+    # Missing criteria
+    no_crit_file = tmp_path / "no_crit.json"
+    write_obligation_json(no_crit_file, {"obligations": [{"id": "1", "title": "No checks", "criteria": []}]})
+    with pytest.raises(IntakeError, match="no acceptance criteria"):
+        led.import_obligations(no_crit_file)
+
+    # Short criterion (< 4 chars)
+    short_crit_file = tmp_path / "short.json"
+    write_obligation_json(short_crit_file, {"obligations": [{"id": "1", "title": "Short check", "criteria": ["bad"]}]})
+    with pytest.raises(IntakeError, match="shorter than 4 characters"):
+        led.import_obligations(short_crit_file)
+
+    # Duplicate criterion across obligations
+    dup_crit_file = tmp_path / "dup.json"
+    write_obligation_json(dup_crit_file, {
+        "obligations": [
+            {"id": "1", "title": "Check 1", "criteria": ["identical check string"]},
+            {"id": "2", "title": "Check 2", "criteria": ["identical check string"]},
+        ]
+    })
+    with pytest.raises(UsageError, match="appears in multiple obligations"):
+        led.import_obligations(dup_crit_file)
+
+
+def test_re_obligations_provenance_and_close_gate(tmp_path):
+    bundle_file = tmp_path / "bundle.json"
+    write_obligation_json(bundle_file, {
+        "target": "crypto.so",
+        "obligations": [
+            {
+                "id": "OBL-CRYPTO",
+                "title": "Crypto Invariants",
+                "criteria": ["round keys match fips-197"]
+            }
+        ]
+    })
+    led = Ledger.create(tmp_path / "L", "clean room", ["spec approved"])
+    led.import_obligations(bundle_file)
+
+    # Verify baseline criterion
+    led.record_evidence("spec approved", "echo ok", "executed_here",
+                        expected_source="literal", output_ref="spec.log")
+
+    # Before obligation evidence: close is blocked, report shows unproven
+    status, blocking, _ = led.outcome()
+    assert status == "NOT REACHED"
+    assert any("round keys match fips-197" in b for b in blocking)
+
+    report_before = led.report()
+    assert "## Reconstruction obligation provenance" in report_before
+    assert "obligation OBL-CRYPTO 'Crypto Invariants' (target: crypto.so): unproven" in report_before
+
+    # Record obligation evidence with binary_oracle
+    led.record_evidence("round keys match fips-197", "python3 diff_test.py", "executed_here",
+                        expected_source="binary_oracle", output_ref="diff_trace.log")
+
+    status, blocking, _ = led.outcome()
+    assert status == "REACHED"
+    assert not blocking
+
+    report_after = led.report()
+    assert "obligation OBL-CRYPTO 'Crypto Invariants' (target: crypto.so): earned (1/1 criteria proven)" in report_after
+
+
+def test_import_obligations_cli(tmp_path):
+    bundle_file = tmp_path / "bundle.json"
+    write_obligation_json(bundle_file, {
+        "obligations": [
+            {"id": "REV-1", "title": "CLI Test Obligation", "criteria": ["cli criterion works"]}
+        ]
+    })
+    path = tmp_path / "L"
+    run_cli("init", str(path), "--intent", "re via cli", "--criterion", "shipped")
+    out = run_cli("import-obligations", str(path), "--obligations", str(bundle_file))
+    assert out.returncode == 0, out.stderr
+    assert "obligation REV-1: CLI Test Obligation -> 1 criterion/criteria" in out.stdout
+    state = Ledger(path).state
+    assert "cli criterion works" in state["criteria"]
+def test_init_with_direct_prompt_flag(tmp_path):
+    path = tmp_path / "L"
+    out = run_cli("init", str(path), "--prompt", "## Goal: deploy auth service\n\n- [ ] JWT verified\n- [ ] Session cookie works\n")
+    assert out.returncode == 0, out.stderr
+    state = Ledger(path).state
+    assert state["intent"] == "deploy auth service"
+    assert "JWT verified" in state["criteria"]
+    assert "Session cookie works" in state["criteria"]
+
+
+def test_frontier_computation_tickets_and_obligations(tmp_path):
+    tickets_dir = tmp_path / "tickets"
+    write_ticket(tickets_dir, "01", "Core Engine", ["engine runs"])
+    write_ticket(tickets_dir, "02", "API Layer", ["api responds"], blocked_by=["01"])
+
+    obl_file = tmp_path / "obligations.json"
+    write_obligation_json(obl_file, {
+        "obligations": [
+            {"id": "OBL-A", "title": "Base Layout", "criteria": ["struct aligned"], "blocked_by": []},
+            {"id": "OBL-B", "title": "Dispatch Loop", "criteria": ["dispatch works"], "blocked_by": ["OBL-A"]}
+        ]
+    })
+
+    led = Ledger.create(tmp_path / "L", "build system", ["system ships"])
+    led.import_tickets(tickets_dir)
+    led.import_obligations(obl_file)
+
+    # Initially, ticket 01 and obligation OBL-A are on the frontier
+    na = led.next_action()
+    assert na["required"] == "work_frontier_ticket"
+    assert "01" in na["because"]
+    assert [t["id"] for t in na["frontier"]["tickets"]] == ["01"]
+    assert [o["id"] for o in na["frontier"]["obligations"]] == ["OBL-A"]
+
+    # Provide evidence for ticket 01
+    led.record_evidence("engine runs", "pytest -k engine", "executed_here",
+                        expected_source="literal", output_ref="t1.log")
+
+    # Now ticket 02 is on the frontier
+    na = led.next_action()
+    assert "02" in na["because"]
+    assert [t["id"] for t in na["frontier"]["tickets"]] == ["02"]
+
+    # Check status --section frontier via CLI
+    out = run_cli("status", str(tmp_path / "L"), "--section", "frontier")
+    assert out.returncode == 0, out.stderr
+    data = json.loads(out.stdout)
+    assert [t["id"] for t in data["frontier"]["tickets"]] == ["02"]
+    assert [o["id"] for o in data["frontier"]["obligations"]] == ["OBL-A"]
+
+
+def test_dangling_obligation_blocked_by_is_refused(tmp_path):
+    obl_file = tmp_path / "dangling.json"
+    write_obligation_json(obl_file, {
+        "obligations": [
+            {"id": "OBL-1", "title": "First", "criteria": ["criterion valid"], "blocked_by": ["NON_EXISTENT"]}
+        ]
+    })
+    led = Ledger.create(tmp_path / "L", "re run", ["done"])
+    with pytest.raises(UsageError, match="blocked by unknown obligation"):
+        led.import_obligations(obl_file)
+
+
+def test_interview_questions_detects_vague_prompts_and_italian_imperatives():
+    from prompt import interview_questions, parse_prompt
+    
+    # 2-word vague intent
+    q1 = interview_questions("app lovable", [])
+    assert any("too vague" in q["question"] for q in q1)
+
+    # Italian imperative in prompt correctly refused as a bare task with no checks
+    with pytest.raises(IntakeError, match="names no check that would prove it done"):
+        parse_prompt("sviluppa l'applicazione web")
+
+
+# --------------------------------------------------------------------------- #
+# one-shot: the minimal honest sequence, batched into one command
+# --------------------------------------------------------------------------- #
+
+
+def test_one_shot_runs_the_full_narrow_sequence(tmp_path):
+    led_path = tmp_path / "L"
+    rc = main([
+        "one-shot", str(led_path),
+        "--incident", "INC-1",
+        "--loop-command", "pytest -k null",
+        "--symptom", "NoneType crash on empty input",
+        "--red-observed", "true",
+        "--claim", "the parser does not guard None",
+        "--prediction", "adding the guard turns the loop green",
+        "--probe", "apply guard and rerun",
+        "--observed", "green: 1 passed",
+        "--fix-note", "add the null guard",
+        "--criterion", "null input returns an empty parse",
+        "--evidence-command", "pytest -k null",
+    ])
+    assert rc == 0
+    led = Ledger(led_path)
+    assert led.state["loops"]["INC-1"]["red"] is True
+    assert led.state["hypotheses"]["INC-1-H1"]["status"] == "surviving"
+    assert led.state["fixes"]["INC-1"]["search"] == "narrow"
+    evidence = [e for e in led.state["evidence"]
+                if e["criterion"] == "null input returns an empty parse"]
+    assert evidence and evidence[-1]["tier"] == "executed_here"
+
+
+def test_one_shot_on_existing_ledger_does_not_reinit(tmp_path):
+    led = Ledger.create(tmp_path / "L", "ship the parser", ["handles CRLF"])
+    rc = main([
+        "one-shot", str(led.root),
+        "--incident", "INC-1",
+        "--loop-command", "pytest -k crlf",
+        "--symptom", "CR survives",
+        "--red-observed", "true",
+        "--claim", "universal newlines strip CR",
+        "--prediction", "binary open fixes it",
+        "--probe", "open(path, 'rb')",
+        "--observed", "green",
+        "--fix-note", "open in binary mode",
+        "--evidence-command", "pytest -k crlf",
+    ])
+    assert rc == 0
+    assert led.state["criteria"] == ["handles CRLF"]
+
+
+# --------------------------------------------------------------------------- #
+# exploratory runs: candidates in, selection out, before any fix
+# --------------------------------------------------------------------------- #
+
+
+def test_exploratory_run_blocks_fix_until_candidate_selected(tmp_path):
+    led = Ledger.create(
+        tmp_path / "L", "pick a parser design",
+        ["parses CRLF without crash"], exploratory=True,
+    )
+    armed(led)
+    led.open_hypothesis("H1", INCIDENT, "None guard missing", "guard makes it green")
+    led.close_hypothesis("H1", "rerun probe", "went green", survives=True)
+    with pytest.raises(Blocked, match="exploratory"):
+        led.begin_fix(INCIDENT, "use design A", search="narrow")
+    led.record_candidates("r7", "arena", 16, files=[".arena/r7/winner.md"])
+    with pytest.raises(Blocked, match="exploratory"):
+        led.begin_fix(INCIDENT, "use design A", search="narrow")
+    led.select_candidate("r7", "a017", by="author", method="arena winner")
+    led.begin_fix(INCIDENT, "use design A", search="narrow")
+    assert led.state["fixes"][INCIDENT]["note"] == "use design A"
+
+
+def test_select_disputed_requires_a_recorded_dispute(tmp_path):
+    led = Ledger.create(tmp_path / "L", "pick", ["parses CRLF"], exploratory=True)
+    led.record_candidates("r1", "parallel", 4)
+    with pytest.raises((Blocked, UsageError)):
+        led.select_candidate("r1", "c1", by="disputed", method="rubric", fork="F1")
+    led.open_fork(
+        "F1", "design A or B", "benchmark divergence", "A",
+        [
+            {"id": "A", "cost": "0d", "risk": "low", "reversibility": "reversible"},
+            {"id": "B", "cost": "1d", "risk": "med", "reversibility": "reversible"},
+        ],
+    )
+    with pytest.raises(Blocked, match="dispute"):
+        led.select_candidate("r1", "c1", by="disputed", method="rubric", fork="F1")
+    led.dispute("F1", challenger="rev-1", author="main",
+                steelman="B handles fan-out natively", verdict="A is viable")
+    led.select_candidate("r1", "c1", by="disputed", method="rubric", fork="F1")
+    assert led.state["candidates"][0]["selected"] == "c1"
+
+
+def test_candidate_selection_by_author_is_disclosed_in_report(tmp_path):
+    led = Ledger.create(tmp_path / "L", "pick", ["parses CRLF"], exploratory=True)
+    led.record_candidates("r1", "manual", 2)
+    led.select_candidate("r1", "mine", by="author", method="my draft")
+    assert "unopposed self-selection" in led.report()
+
+
+def test_candidate_recording_refuses_zero_count(tmp_path):
+    led = Ledger.create(tmp_path / "L", "pick", ["parses CRLF"])
+    with pytest.raises(UsageError, match=">= 1"):
+        led.record_candidates("r1", "arena", 0)
+
+
+def test_next_action_routes_exploratory_to_candidates(tmp_path):
+    from derivation import next_action
+    led = Ledger.create(tmp_path / "L", "pick", ["parses CRLF"], exploratory=True)
+    assert next_action(led.state)["required"] == "record-candidates"
+    led.record_candidates("r1", "arena", 8)
+    assert next_action(led.state)["required"] == "select-candidate"
+    led.select_candidate("r1", "c2", by="author", method="top score")
+    assert next_action(led.state)["required"] != "select-candidate"
+
+
+# --------------------------------------------------------------------------- #
+# the intake critic: garbage criteria get named, not silently accepted
+# --------------------------------------------------------------------------- #
+
+
+def test_intake_critic_flags_unbounded_quality():
+    from prompt import critic_flags
+    flags = critic_flags("ship the parser", ["be fast and robust"])
+    assert [f["flag"] for f in flags] == ["unbounded_quality"]
+    assert "bound" in flags[0]["question"]
+
+
+def test_intake_critic_leaves_verifiable_criteria_alone():
+    from prompt import critic_flags
+    assert critic_flags(
+        "ship the parser that handles CRLF",
+        ["handles CRLF", "rejects malformed"],
+    ) == []
+
+
+def test_criterion_restating_intent_is_refused_at_init(tmp_path):
+    intent = ("the payment service retries failed webhook deliveries with "
+              "exponential backoff and logs every attempt")
+    with pytest.raises(IntakeError, match="restates the intent"):
+        Ledger.create(tmp_path / "L", intent, [intent])
+
+
+def test_short_criterion_inside_intent_is_not_a_restatement(tmp_path):
+    # A short criterion that narrows the intent is a legitimate check, not a
+    # restatement: refusing it would make every focused magnet uncreatable.
+    led = Ledger.create(
+        tmp_path / "L", "ship the parser that handles CRLF", ["handles CRLF"],
+    )
+    assert led.state["criteria"] == ["handles CRLF"]
+
+
+def test_flagged_criterion_requires_explicit_oracle(tmp_path):
+    led = Ledger.create(
+        tmp_path / "L", "ship the parser", ["handles CRLF", "be fast and robust"],
+    )
+    armed(led)
+    led.open_hypothesis("H1", INCIDENT, "None guard missing", "guard makes it green")
+    led.close_hypothesis("H1", "rerun probe", "went green", survives=True)
+    with pytest.raises(Blocked, match="intake critic"):
+        led.record_evidence("be fast and robust", "pytest -k fast", "executed_here")
+    led.record_evidence(
+        "be fast and robust", "pytest -k fast", "executed_here",
+        expected_source="literal",
+    )
+    assert led.state["evidence"][-1]["expected_source"] == "literal"

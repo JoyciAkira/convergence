@@ -20,3 +20,17 @@ Read-only computation over Ledger state (e.g., `outcome`, `report`, `next_action
 
 ## ClaimComparator
 Interface at the similarity seam for paraphrase detection during hypothesis opening. Default adapter uses Jaccard overlap; test adapter uses exact match. Injected into Ledger at construction.
+## ReconstructionObligation
+A structural, control-flow, or behavioral invariant derived by reverse engineering tools (REA, Ghidra, Hopper) that a clean-room reimplementation or binary fix must satisfy. Ingested via `import-obligations` and tracked to proven/unproven status.
+
+## BinaryOracle
+An execution environment (native runner, QEMU, Wine) running the original binary to generate ground-truth output against which clean-room code is differentially tested, satisfying the anti-tautology evidence requirement without circular code verification.
+
+## Candidate
+A recorded solution proposal from an exploration pass (arena run, parallel sub-agents, manual drafts). The Ledger never generates candidates; `record-candidates` stores provenance (source, count, files) and `select-candidate` records which one the run pursues, with `disputed` (contested on a fork) or `author` (unopposed self-selection, disclosed in the report) as the two selection weights.
+
+## Intake Critic
+Deterministic red-flag pass over the magnet's criteria at init: `restates_intent` (long criterion adding nothing to the intent) refuses the init; `unbounded_quality` and `no_oracle` flag the criterion in the ledger, and evidence against a flagged criterion requires an explicit `--expected-source`.
+
+## One-shot
+The minimal honest narrow sequence (init, declare/run loop, one settled hypothesis, begin-fix narrow, evidence) batched into a single CLI command. Every step delegates to the same gate-checked Ledger methods; `--red-observed` accepts only `true`, and each step is idempotent so an interrupted batch resumes.

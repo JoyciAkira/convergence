@@ -64,7 +64,7 @@ DEONTIC_RE = re.compile(
 IMPERATIVE_RE = re.compile(
     r"^\s*(?:please\s+)?(?:build|make|create|implement|add|fix|ship|write|refactor|"
     r"update|remove|delete|port|set up|porta|crea|implementa|aggiungi|fixa|scrivi|"
-    r"rifattorizza|aggiorna|rimuovi|elimina)\b",
+    r"rifattorizza|aggiorna|rimuovi|elimina|fai|costruisci|sviluppa|realizza)\b",
     re.IGNORECASE,
 )
 
@@ -364,3 +364,143 @@ def parse_prompt(text):
         "hypotheses": _finalise(raw_items[KIND_HYPOTHESIS], KIND_HYPOTHESIS),
         "exclusions": [i["text"] for i in _finalise(raw_items[KIND_EXCLUSION], "exclusion")],
     }
+
+
+def interview_questions(intent, criteria):
+    """Ambiguity interview: one pointed question per vague edge of the magnet.
+
+    Deterministic rules — no guessing, no invention:
+    * a missing or very short intent (< 10 chars) cannot name an outcome;
+    * a criterion phrased as a bare task imperative ("build a REST API") with
+      no requirement wording states work, not a check;
+    * a criterion phrased as a question ("should it support BOM?") states
+      doubt, not a check.
+    Each question names the edge it challenges and the answer that would
+    close it. An empty list means the magnet is interview-clean.
+    """
+    questions = []
+    text_intent = str(intent or "").strip()
+    if not text_intent:
+        questions.append({
+            "edge": "intent",
+            "question": "no outcome is stated: what single outcome is actually wanted?",
+        })
+    words = text_intent.split()
+    if len(text_intent) < 10 or (len(words) < 3 and not any(DEONTIC_RE.search(w) for w in words)):
+        questions.append({
+            "edge": "intent",
+            "question": f"intent {text_intent!r} is too vague to pull against: "
+                         "what single outcome is actually wanted, in one sentence?",
+        })
+    for c in criteria or []:
+        text = c.get("text") if isinstance(c, dict) else str(c)
+        text = (text or "").strip()
+        if not text:
+            continue
+        if text.endswith("?"):
+            questions.append({
+                "edge": "criterion",
+                "criterion": text,
+                "question": f"{text!r} states doubt, not a check: rephrase it as "
+                             "an observable claim and name the command that would prove it.",
+            })
+        elif IMPERATIVE_RE.match(text) and not DEONTIC_RE.search(text):
+            questions.append({
+                "edge": "criterion",
+                "criterion": text,
+                "question": f"{text!r} states a task, not a check: what observable "
+                             "claim would prove it done, and which re-runnable command closes it?",
+            })
+    return questions
+
+
+#: Quality adjectives that promise a property without bounding it. A criterion
+#: containing one of these and no measurable bound is a vibe, not a check.
+QUALITY_WORDS = frozenset({
+    "fast", "faster", "quick", "robust", "good", "better", "correct", "correctly",
+    "clean", "efficient", "reliable", "secure", "scalable", "optimal", "properly",
+    "maintainable", "usable", "user-friendly", "performant", "solid", "stable",
+})
+
+#: A measurable bound somewhere in the text answers the quality adjective.
+BOUND_RE = re.compile(
+    r"\d|second|seconds|ms|millisec|percent|%|at least|at most|exactly|within"
+    r"|threshold|limit|budget|maximum|minimum|\bmax\b|\bmin\b|no more than|under \d",
+    re.IGNORECASE,
+)
+
+#: Observable verbs that name what the world does when the criterion holds.
+ORACLE_RE = re.compile(
+    r"return|exit|print|output|match|contain|equal|respond|reject|accept|handle"
+    r"|create|delete|send|render|log|write|read|load|serve|listen|fail|pass"
+    r"|show|display|import|export|emit|produce|store|persist|commit|succeed"
+    r"|open|close|connect|receive|download|upload|compile|build|deploy",
+    re.IGNORECASE,
+)
+
+STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "that",
+    "this", "it", "is", "are", "be", "as", "at", "by", "from", "its", "must",
+    "shall", "should", "will", "can", "when", "then",
+})
+
+
+def _content_words(text):
+    return {w for w in re.findall(r"[a-z0-9]+", str(text).casefold()) if w not in STOPWORDS}
+
+
+def critic_flags(intent, criteria):
+    """Deterministic red-flag critic over the magnet's criteria (garbage-in gate).
+
+    Three flags, each with the question whose answer closes it:
+
+    * ``restates_intent`` — a long criterion (>= 6 content words) that adds
+      nothing to the intent's own words: it would pass by construction. A
+      short criterion inside the intent is a legitimate narrow check and is
+      never flagged. This one is a refusal, not a question.
+    * ``unbounded_quality`` — a quality adjective with no measurable bound
+      anywhere in the criterion ("fast", "robust"): asks for the number.
+    * ``no_oracle`` — neither a bound nor an observable verb: asks what
+      command output would look different if the criterion failed.
+
+    The critic never invents wording; it only names the edge and the answer
+    that would close it, like interview_questions.
+    """
+    flags = []
+    intent_words = _content_words(intent)
+    for c in criteria or []:
+        text = c.get("text") if isinstance(c, dict) else str(c)
+        text = (text or "").strip()
+        if not text:
+            continue
+        words = _content_words(text)
+        if intent_words and len(words) >= 6 and words <= intent_words:
+            flags.append({
+                "criterion": text,
+                "flag": "restates_intent",
+                "question": f"{text!r} restates the intent instead of checking it: "
+                            "a criterion that passes by construction cannot fail. "
+                            "Name an observable consequence that would be false if the "
+                            "intent were not met.",
+            })
+            continue
+        lowered = text.casefold()
+        quality = sorted(w for w in QUALITY_WORDS if re.search(rf"\b{re.escape(w)}\b", lowered))
+        has_bound = bool(BOUND_RE.search(text))
+        has_oracle = bool(ORACLE_RE.search(text))
+        if quality and not has_bound:
+            flags.append({
+                "criterion": text,
+                "flag": "unbounded_quality",
+                "question": f"{text!r} promises {', '.join(quality)} with no measurable "
+                            "bound: what number, threshold or budget makes it checkable, "
+                            "and which command measures it?",
+            })
+        elif not has_bound and not has_oracle:
+            flags.append({
+                "criterion": text,
+                "flag": "no_oracle",
+                "question": f"{text!r} names no observable effect: what command output "
+                            "would look different if this criterion failed?",
+            })
+    return flags

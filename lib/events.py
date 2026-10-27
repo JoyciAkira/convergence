@@ -20,8 +20,62 @@ def _ev_init(s: dict, ev: dict) -> None:
     s["intent_frozen"] = False
     s["intent_freeze_at"] = None
     s["infra"] = {}
-    s["meta"] = {}
+    s["meta"] = {
+        "exploratory": bool(ev.get("exploratory", False)),
+        "critic": list(ev.get("critic") or []),
+    }
     s["tickets"] = []
+    s["obligations"] = []
+    s["candidates"] = []
+
+
+def _ev_candidates_recorded(s: dict, ev: dict) -> None:
+    """Record that an exploration pass produced candidate solutions.
+
+    Provenance, not endorsement: the ledger stores where the candidates came
+    from (arena run, parallel agents, manual drafts) so a later selection can
+    name what it chose among. Validation lives here, not only in the caller,
+    so replay refuses the same violations.
+    """
+    cands = s.setdefault("candidates", [])
+    known = {c["run_id"] for c in cands}
+    for c in ev.get("candidates", []):
+        if c["run_id"] in known:
+            prev = next((p for p in cands if p["run_id"] == c["run_id"]), None)
+            if prev == c:
+                continue  # idempotent replay of an identical recording
+            raise UsageError(
+                f"candidate run {c['run_id']!r} is already recorded with different "
+                f"content; refusing ambiguous re-recording"
+            )
+        known.add(c["run_id"])
+        cands.append(dict(c))
+
+
+def _ev_candidate_selected(s: dict, ev: dict) -> None:
+    """Record which candidate solution this run pursues.
+
+    ``by='disputed'`` means a challenger contested the choice on a recorded
+    fork; ``by='author'`` is a disclosure the report must carry — selecting
+    your own candidate without opposition is a method note, not a verdict.
+    """
+    cands = s.get("candidates", [])
+    hit = next((c for c in cands if c["run_id"] == ev["run_id"]), None)
+    if hit is None:
+        raise UsageError(
+            f"no candidate run {ev['run_id']!r} recorded; record the exploration "
+            f"pass with record-candidates before selecting from it"
+        )
+    if hit.get("selected") is not None:
+        raise UsageError(
+            f"candidate run {ev['run_id']!r} already has a selection "
+            f"({hit['selected']!r}); a new selection needs a disputed fork that "
+            f"moves it"
+        )
+    hit["selected"] = ev["id"]
+    hit["selected_by"] = ev["by"]
+    hit["selection_method"] = ev["method"]
+    hit["selection_fork"] = ev.get("fork")
 
 
 def _ev_intent_frozen(s: dict, ev: dict) -> None:
@@ -41,6 +95,9 @@ def _ev_tickets_imported(s: dict, ev: dict) -> None:
     known_criteria = set(s.get("criteria", []))
     for t in ev.get("tickets", []):
         if t["id"] in known_ids:
+            prev = next((p for p in tickets if p["id"] == t["id"]), None)
+            if prev == t:
+                continue  # idempotent replay of an identical import
             raise UsageError(f"ticket {t['id']} is already imported")
         for c in t.get("criteria", []):
             if c in known_criteria:
@@ -52,6 +109,34 @@ def _ev_tickets_imported(s: dict, ev: dict) -> None:
         known_criteria.update(t.get("criteria", []))
         tickets.append(dict(t))
         s["criteria"] = list(s.get("criteria", [])) + list(t.get("criteria", []))
+
+
+def _ev_obligations_imported(s: dict, ev: dict) -> None:
+    """Map reconstruction obligations onto acceptance criteria.
+
+    Obligation boundaries are kept as provenance: the report discloses which
+    obligations were earned through verification evidence. Validation lives here,
+    not only in the caller, so replay refuses the same violations.
+    """
+    obligations = s.setdefault("obligations", [])
+    known_ids = {o["id"] for o in obligations}
+    known_criteria = set(s.get("criteria", []))
+    for o in ev.get("obligations", []):
+        if o["id"] in known_ids:
+            prev = next((p for p in obligations if p["id"] == o["id"]), None)
+            if prev == o:
+                continue  # idempotent replay of an identical import
+            raise UsageError(f"obligation {o['id']} is already imported")
+        for c in o.get("criteria", []):
+            if c in known_criteria:
+                raise UsageError(
+                    f"criterion {c!r} is already an acceptance criterion; each must map "
+                    f"to exactly one obligation, or the report cannot say which earned it"
+                )
+        known_ids.add(o["id"])
+        known_criteria.update(o.get("criteria", []))
+        obligations.append(dict(o))
+        s["criteria"] = list(s.get("criteria", [])) + list(o.get("criteria", []))
 
 
 def _ev_loop_declare(s: dict, ev: dict) -> None:
@@ -349,6 +434,9 @@ HANDLERS: dict[str, Any] = {
     "stop_runtime": _ev_stop_runtime,
     "intent_frozen": _ev_intent_frozen,
     "tickets_imported": _ev_tickets_imported,
+    "obligations_imported": _ev_obligations_imported,
+    "candidates_recorded": _ev_candidates_recorded,
+    "candidate_selected": _ev_candidate_selected,
     "meta_record": _ev_meta_record,
     "snapshot": _ev_snapshot,
 }

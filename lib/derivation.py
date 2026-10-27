@@ -160,6 +160,31 @@ def _ticket_provenance_rows(state) -> list[str]:
     return rows_out
 
 
+def _obligation_provenance_rows(state) -> list[str]:
+    """Reconstruction obligation boundaries kept as provenance: earned vs unproven.
+
+    An obligation is earned only when every criterion it introduced carries
+    evidence that is not unavailable.
+    """
+    obligations = state.get("obligations", [])
+    if not obligations:
+        return ["- None imported"]
+    latest_tier: dict[str, str] = {}
+    for e in state.get("evidence", []):
+        latest_tier[e["criterion"]] = e["tier"]
+    rows_out = []
+    for o in obligations:
+        proven = [c for c in o["criteria"] if latest_tier.get(c) not in (None, "unavailable")]
+        unproven = [c for c in o["criteria"] if c not in proven]
+        mark = "earned" if not unproven else "unproven"
+        target_info = f" (target: {o['target']})" if o.get("target") else ""
+        line = f"- obligation {o['id']} {o['title']!r}{target_info}: {mark} ({len(proven)}/{len(o['criteria'])} criteria proven)"
+        if unproven:
+            line += " — unproven: " + ", ".join(repr(c) for c in unproven)
+        rows_out.append(line)
+    return rows_out
+
+
 def _requirement_notice(state) -> str:
     """One-line notice that tells the reader what the run still owes, if anything."""
     status, blocking, _ = outcome(state)
@@ -441,6 +466,30 @@ def report(state: dict) -> str:
     lines += rows(_ticket_provenance_rows(state), "`control.jsonl`")
     lines.append("")
 
+    if state.get("obligations"):
+        lines += ["## Reconstruction obligation provenance", "", "Which reverse engineering obligations earned their close on evidence, and which remain unproven:", ""]
+        lines += rows(_obligation_provenance_rows(state), "`control.jsonl`")
+        lines.append("")
+
+    candidates = state.get("candidates", [])
+    if state.get("meta", {}).get("exploratory") or candidates:
+        cand_rows = []
+        for c in candidates:
+            row = f"- run {c['run_id']!r}: {c['count']} candidate(s) from {c['source']}"
+            if c.get("selected"):
+                row += (f"; selected {c['selected']!r} by {c['selected_by']} "
+                        f"({c.get('selection_method')})")
+                if c.get("selected_by") == "author":
+                    row += " — DISCLOSURE: unopposed self-selection, never contested"
+            else:
+                row += "; not selected"
+            cand_rows.append(row)
+        if not cand_rows:
+            cand_rows = ["- the run is exploratory but no candidate solutions were ever recorded"]
+        lines += ["## Candidates", "", "What the run chose among, and how the choice was made:", ""]
+        lines += rows(cand_rows, "`control.jsonl`")
+        lines.append("")
+
     lines += ["## Auto-critique", "", "The run critiques its own record before anyone else can. Every row points at a record, not a mood:", ""]
     lines += rows(auto_critique(state), "`control.jsonl`")
     lines.append("")
@@ -468,8 +517,10 @@ def next_action(state: dict, validate_infra_fn=None) -> dict[str, Any]:
         if c["kind"] == "information_missing" and c["signature"] not in resolved
     ]
 
-    def answer(required: str, because: str) -> dict[str, Any]:
+    def answer(required: str, because: str, extra: dict | None = None) -> dict[str, Any]:
         out: dict[str, Any] = {"required": required, "because": because}
+        if extra:
+            out.update(extra)
         if parked:
             out["parked_paths"] = parked
             out["parked_note"] = (
@@ -518,6 +569,24 @@ def next_action(state: dict, validate_infra_fn=None) -> dict[str, Any]:
             DIRECTIVE_MESSAGE.get(kind, f"directive: {kind}"),
         )
 
+    # Exploratory runs owe a recorded, selected candidate before any fix
+    if state.get("meta", {}).get("exploratory"):
+        candidates = state.get("candidates", [])
+        if not candidates:
+            return answer(
+                "record-candidates",
+                "the run is exploratory: no candidate solutions are recorded yet. "
+                "Run the exploration (arena --quick, parallel agents, manual drafts), "
+                "then record it with record-candidates.",
+            )
+        if not any(c.get("selected") for c in candidates):
+            return answer(
+                "select-candidate",
+                "candidate solutions are recorded but none is selected: choose the one "
+                "the run pursues (disputed selection preferred; author selection is "
+                "disclosed in the report).",
+            )
+
     # Open hypotheses outrank forks
     open_hyps = [h for h in state.get("hypotheses", {}).values() if h["status"] == "open"]
     if open_hyps:
@@ -542,6 +611,24 @@ def next_action(state: dict, validate_infra_fn=None) -> dict[str, Any]:
     if status == "REACHED":
         return answer("close", "the outcome is reached")
 
+    frontiers = compute_frontier(state)
+    if frontiers["tickets"]:
+        next_t = frontiers["tickets"][0]
+        return answer(
+            "work_frontier_ticket",
+            f"ticket {next_t['id']!r} ({next_t['title']}) is on the frontier; "
+            f"next unproven criterion: {next_t['unproven_criteria'][0]!r}",
+            extra={"frontier": frontiers},
+        )
+    if frontiers["obligations"]:
+        next_o = frontiers["obligations"][0]
+        return answer(
+            "work_frontier_obligation",
+            f"obligation {next_o['id']!r} ({next_o['title']}) is on the frontier; "
+            f"next unproven criterion: {next_o['unproven_criteria'][0]!r}",
+            extra={"frontier": frontiers},
+        )
+
     if blocking:
         return answer("address_blocking", blocking[0])
 
@@ -549,6 +636,64 @@ def next_action(state: dict, validate_infra_fn=None) -> dict[str, Any]:
 
 
 # Auto-critique (10): the report turns the ledger's scepticism on its own run. #
+
+
+def compute_frontier(state: dict) -> dict[str, list[dict]]:
+    """Compute the unblocked frontier of tickets and reconstruction obligations.
+
+    A ticket or obligation is on the frontier when:
+      1. It is not yet earned (it has at least one unproven criterion).
+      2. All items it is blocked by are already earned.
+    """
+    latest_tier: dict[str, str] = {}
+    for e in state.get("evidence", []):
+        latest_tier[e["criterion"]] = e["tier"]
+
+    # 1. Ticket frontier
+    tickets = state.get("tickets", [])
+    earned_ticket_ids = set()
+    for t in tickets:
+        unproven = [c for c in t["criteria"] if latest_tier.get(c) in (None, "unavailable")]
+        if not unproven:
+            earned_ticket_ids.add(t["id"])
+
+    frontier_tickets = []
+    for t in tickets:
+        if t["id"] in earned_ticket_ids:
+            continue
+        blockers = t.get("blocked_by", [])
+        if all(b in earned_ticket_ids for b in blockers):
+            frontier_tickets.append({
+                "id": t["id"],
+                "title": t["title"],
+                "unproven_criteria": [c for c in t["criteria"] if latest_tier.get(c) in (None, "unavailable")],
+            })
+
+    # 2. Obligation frontier
+    obligations = state.get("obligations", [])
+    earned_obl_ids = set()
+    for o in obligations:
+        unproven = [c for c in o["criteria"] if latest_tier.get(c) in (None, "unavailable")]
+        if not unproven:
+            earned_obl_ids.add(o["id"])
+
+    frontier_obligations = []
+    for o in obligations:
+        if o["id"] in earned_obl_ids:
+            continue
+        blockers = o.get("blocked_by", [])
+        if all(b in earned_obl_ids for b in blockers):
+            frontier_obligations.append({
+                "id": o["id"],
+                "title": o["title"],
+                "target": o.get("target"),
+                "unproven_criteria": [c for c in o["criteria"] if latest_tier.get(c) in (None, "unavailable")],
+            })
+
+    return {
+        "tickets": frontier_tickets,
+        "obligations": frontier_obligations,
+    }
 
 
 def auto_critique(state: dict) -> list[str]:
@@ -710,7 +855,8 @@ def pipeline_route(state: dict, validate_infra_fn=None) -> dict[str, Any]:
 
     Lanes: investigate (drive the hypothesis loop), decide (adjudicate forks),
     unblock (source missing facts / rebuild infrastructure), verify (collect
-    evidence), human (escalate a decision the agent's authority cannot take),
+    evidence), explore (record or select candidate solutions in an exploratory
+    run), human (escalate a decision the agent's authority cannot take),
     close (the run owes nothing further).
 
     `fallback` names the lane to work when the primary one is blocked from
@@ -762,6 +908,9 @@ def pipeline_route(state: dict, validate_infra_fn=None) -> dict[str, Any]:
             if heavy else meanwhile()
         )
         return out("decide", action["because"], fallback)
+
+    if required in ("record-candidates", "select-candidate"):
+        return out("explore", action["because"], meanwhile())
 
     if required in ("resolve_block", "validate-infra"):
         return out("unblock", action["because"], meanwhile(gap=True))

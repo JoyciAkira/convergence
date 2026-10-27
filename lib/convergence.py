@@ -20,12 +20,47 @@ from __future__ import annotations
 
 import argparse
 import copy
-import fcntl
 import functools
 import json
 import re
 import sys
 import time
+
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:  # Windows: no fcntl; fall back to msvcrt or no-op lock
+    fcntl = None
+    _HAS_FCNTL = False
+
+
+def _lock_exclusive(handle):
+    """Portable exclusive lock: fcntl on POSIX, msvcrt on Windows, no-op otherwise."""
+    if _HAS_FCNTL:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        return
+    try:
+        import msvcrt
+        import os
+        handle.flush()
+        try:
+            os.fseek(handle.fileno(), 0, os.SEEK_SET)
+        except OSError:
+            pass
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    except (ImportError, OSError):
+        return
+
+
+def _unlock(handle):
+    if _HAS_FCNTL:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return
+    try:
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except (ImportError, OSError):
+        return
 from contextlib import contextmanager
 from pathlib import Path
 from runtime import FakeRuntimeManager, RealOSRuntimeManager, RuntimeManager
@@ -70,7 +105,7 @@ EVIDENCE_TIERS = ("executed_here", "reproduced_independently", "unavailable")
 
 #: `code` means the expectation was recomputed from the implementation. That is a
 #: tautology and can never disagree with the code, so it is rejected outright.
-EXPECTED_SOURCES = ("spec", "literal", "worked_example", "independent_oracle", "code")
+EXPECTED_SOURCES = ("spec", "literal", "worked_example", "independent_oracle", "binary_oracle", "rea_evidence", "code")
 
 #: A fix may not be written before this many distinct hypotheses have been tested.
 #: One plausible idea anchoring the whole investigation is the failure mode.
@@ -113,6 +148,11 @@ def _closest(needle, haystack):
 #: choice survives even though the verdict is unaffected. For a small, fully reproduced
 #: defect whose mechanism is unambiguous, demanding three rivals is theatre.
 SEARCH_WIDTH = {"narrow": 1, "full": MIN_HYPOTHESES}
+
+#: Where candidate solutions may come from. The ledger does not generate
+#: candidates (that is arena, parallel agents, or the author); it records
+#: provenance so a later selection can name what it chose among.
+CANDIDATE_SOURCES = ("arena", "parallel", "manual", "other")
 
 #: Rows rendered per report section before the report points at the ledger instead.
 REPORT_ROW_CAP = 12
@@ -456,12 +496,12 @@ class Ledger:
         stale. Everything a mutator checks and writes happens inside this section.
         """
         with (self.root / LOCK).open("a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            _lock_exclusive(handle)
             try:
                 self._replay_all()
                 yield
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                _unlock(handle)
 
     # -- multi-agent + compact (5) ------------------------------------------- #
 
@@ -592,14 +632,26 @@ class Ledger:
     # -- init --------------------------------------------------------------- #
 
     @classmethod
-    def create(cls, root, intent, criteria=(), freeze=False):
+    def create(cls, root, intent, criteria=(), freeze=False, exploratory=False, critic=None):
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
         with (root / LOCK).open("a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            _lock_exclusive(handle)
             try:
                 if (root / LOGS["control"]).exists():
                     raise Blocked(f"ledger already initialised: {root}")
+                if critic is None:
+                    from prompt import critic_flags
+                    critic = critic_flags(intent, criteria)
+                restatements = [f for f in (critic or []) if f.get("flag") == "restates_intent"]
+                if restatements:
+                    raise IntakeError(
+                        "a criterion restates the intent instead of checking it, so it "
+                        "passes by construction and can never fail: "
+                        + "; ".join(repr(f["criterion"]) for f in restatements)
+                        + ". Name an observable consequence that would be false if the "
+                        "intent were not met."
+                    )
                 for name in LOGS.values():
                     (root / name).touch()
                 ledger = cls(root)
@@ -609,6 +661,8 @@ class Ledger:
                         "ev": "init",
                         "intent": req(intent, "--intent"),
                         "criteria": list(criteria or []),
+                        "exploratory": bool(exploratory),
+                        "critic": list(critic or []),
                     },
                 )
                 if freeze:
@@ -624,7 +678,7 @@ class Ledger:
                     ledger._append("control", {"ev": "intent_frozen"})
                 return ledger
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                _unlock(handle)
 
     @transactional
     def freeze_intent(self):
@@ -662,6 +716,16 @@ class Ledger:
                 "a criterion shorter than 4 characters is unlikely to be verifiable: "
                 f"{criteria}"
             )
+        from prompt import critic_flags
+        restatements = [f for f in critic_flags(intent, criteria) if f["flag"] == "restates_intent"]
+        if restatements:
+            raise IntakeError(
+                "a criterion restates the intent instead of checking it, so it "
+                "passes by construction and can never fail: "
+                + "; ".join(repr(f["criterion"]) for f in restatements)
+                + ". Name an observable consequence that would be false if the "
+                "intent were not met."
+            )
         return {"intent": intent, "criteria": criteria}
 
     @transactional
@@ -695,7 +759,116 @@ class Ledger:
         from tickets import parse_tickets
 
         tickets = parse_tickets(directory)
-        self._append("control", {"ev": "tickets_imported", "tickets": tickets})
+        existing = {t["id"]: t for t in self.state.get("tickets", [])}
+        fresh = []
+        for t in tickets:
+            prev = existing.get(t["id"])
+            if prev is not None:
+                if prev == t:
+                    continue  # idempotent re-import: identical ticket already recorded
+                raise UsageError(
+                    f"ticket {t['id']} is already imported with different content; "
+                    f"refusing ambiguous re-import"
+                )
+            fresh.append(t)
+        if not fresh:
+            return self
+        self._append("control", {"ev": "tickets_imported", "tickets": fresh})
+        return self
+
+    @transactional
+    def import_obligations(self, path):
+        """Map reverse engineering reconstruction obligations onto acceptance criteria.
+
+        The upstream reverse engineering workflow (REA / Ghidra / clean-room specs)
+        produces ReconstructionObligationLedgers with structural, behavioral, or
+        control-flow obligations. Importing obligations keeps the boundary visible:
+        every criterion remembers its obligation, so the report can name which
+        obligation *earned* its close and which remains unproven.
+        """
+        from obligations import parse_obligations
+
+        obligations = parse_obligations(path)
+        existing = {o["id"]: o for o in self.state.get("obligations", [])}
+        fresh = []
+        for o in obligations:
+            prev = existing.get(o["id"])
+            if prev is not None:
+                if prev == o:
+                    continue  # idempotent re-import: identical obligation already recorded
+                raise UsageError(
+                    f"obligation {o['id']} is already imported with different content; "
+                    f"refusing ambiguous re-import"
+                )
+            fresh.append(o)
+        if not fresh:
+            return self
+        self._append("control", {"ev": "obligations_imported", "obligations": fresh})
+        return self
+
+    # -- exploration: candidates in, selection out --------------------------- #
+
+    @transactional
+    def record_candidates(self, run_id, source, count, note=None, files=()):
+        """Record that an exploration pass produced candidate solutions.
+
+        The ledger does not generate candidates — arena, parallel agents or the
+        author do. This records provenance (where they came from, how many,
+        where they live) so the later selection can name what it chose among.
+        """
+        self._enforce_directive("record_candidates")
+        run_id = req(run_id, "--run-id")
+        source = one_of(source, CANDIDATE_SOURCES, "--source")
+        count = int(count)
+        if count < 1:
+            raise UsageError("--count must be >= 1: an exploration that produced "
+                             "nothing is not a recording, it is a finding")
+        candidate = {
+            "run_id": run_id,
+            "source": source,
+            "count": count,
+            "note": note,
+            "files": list(files or []),
+        }
+        self._append("control", {"ev": "candidates_recorded", "candidates": [candidate]})
+        self._clear_directive("record_candidates")
+        return self
+
+    @transactional
+    def select_candidate(self, run_id, ident, by, method, fork=None):
+        """Record which candidate solution this run pursues.
+
+        ``by='disputed'`` requires a recorded dispute on ``--fork``: the choice
+        was contested by a separate context before it was made. ``by='author'``
+        records an unopposed self-selection; it never blocks, but the report
+        carries it under disclosures — selecting your own candidate in silence
+        is exactly what this ledger exists to prevent.
+        """
+        self._enforce_directive("select_candidate")
+        run_id = req(run_id, "--run-id")
+        ident = req(ident, "--id")
+        by = one_of(by, ("disputed", "author"), "--by")
+        method = req(method, "--method")
+        if by == "disputed":
+            fork = req(fork, "--fork (required when --by disputed)")
+            if not any(d.get("fork") == fork for d in self.state.get("disputes", [])):
+                raise Blocked(
+                    f"--by disputed requires a dispute on fork {fork!r}, and none is "
+                    f"recorded. Run dispute first — a selection 'disputed' without a "
+                    f"dispute launders a preference into a verdict."
+                )
+        self._append(
+            "control",
+            {
+                "ev": "candidate_selected",
+                "run_id": run_id,
+                "id": ident,
+                "by": by,
+                "method": method,
+                "fork": fork if by == "disputed" else None,
+            },
+        )
+        self._clear_directive("select_candidate")
         return self
 
     # -- entry A: the feedback loop ----------------------------------------- #
@@ -800,6 +973,18 @@ class Ledger:
     @transactional
     def begin_fix(self, incident, note, search="full"):
         self._enforce_directive("begin_fix")
+        meta = self.state.get("meta", {})
+        if meta.get("exploratory") and not any(
+            c.get("selected") for c in self.state.get("candidates", [])
+        ):
+            raise Blocked(
+                "this run is exploratory (init --exploratory), so a fix may not be "
+                "chosen before candidate solutions exist and one has been selected: "
+                "run the exploration (arena --quick, parallel agents, manual drafts), "
+                "record it with record-candidates, choose with select-candidate, then "
+                "begin-fix. An exploratory run that skips selection is a preference "
+                "wearing a verdict."
+            )
         search = one_of(search, tuple(SEARCH_WIDTH), "--search")
         required = SEARCH_WIDTH[search]
         tested = [h for h in self.state["hypotheses"].values() if h["incident"] == incident]
@@ -1120,12 +1305,24 @@ class Ledger:
                     "expected_source=code means the expectation was recomputed from the "
                     "implementation. Such a check passes by construction and can never "
                     "disagree with the code. Use spec, literal, worked_example or "
-                    "independent_oracle."
+                    "independent_oracle, binary_oracle, or rea_evidence."
                 )
+        critic_flagged = {
+            f["criterion"]: f["flag"]
+            for f in self.state.get("meta", {}).get("critic", [])
+        }
+        if criterion in critic_flagged and expected_source is None:
+            raise Blocked(
+                f"criterion {criterion!r} was flagged by the intake critic "
+                f"({critic_flagged[criterion]}): vague phrasing cannot lean on an "
+                f"implicit oracle. Pass --expected-source explicitly (spec, literal, "
+                f"worked_example, independent_oracle, binary_oracle, rea_evidence), or "
+                f"move the criterion via a disputed fork to wording a command can check."
+            )
         if tier == "reproduced_independently":
             recorder = req(recorder, "--recorder")
             reproduced_by = req(reproduced_by, "--reproduced-by")
-            if reproduced_by == recorder:
+            if str(reproduced_by).strip().casefold() == str(recorder).strip().casefold():
                 raise Blocked(
                     f"--reproduced-by equals --recorder ({recorder!r}). Re-reading your own "
                     f"summary is not independent reproduction; run it in another context."
@@ -1177,6 +1374,26 @@ class Ledger:
         "mail": {
             "driver": "mail",
             "placeholder": "smtp://localhost:1025",
+        },
+        "ghidra": {
+            "driver": "ghidra",
+            "placeholder": "ghidra_headless /tmp/ghidra_project",
+        },
+        "rizin": {
+            "driver": "rizin",
+            "placeholder": "rizin -q -c 'aaa' target.bin",
+        },
+        "radare2": {
+            "driver": "radare2",
+            "placeholder": "radare2 -q -c 'aaa' target.bin",
+        },
+        "frida": {
+            "driver": "frida",
+            "placeholder": "frida -U -f target",
+        },
+        "qemu": {
+            "driver": "qemu",
+            "placeholder": "qemu-x86_64 target.bin",
         },
     }
 
@@ -1268,6 +1485,16 @@ class Ledger:
         """
         name = req(name, "--name")
         command = req(command, "--command")
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+            raise UsageError(
+                f"--name {name!r} must be UPPER_SNAKE (e.g. LLM_API_KEY) so evidence "
+                f"commands can reference it without pasting values"
+            )
+        if name not in command and f"${name}" not in command and f"${{{name}}}" not in command:
+            raise UsageError(
+                f"--command must reference the secret by name ({name}, ${name} or "
+                f"${{{name}}}); never paste the value — only the retrieval command is recorded"
+            )
         self._append(
             "control",
             {"ev": "store_secret", "name": name, "command": command},
@@ -1661,6 +1888,8 @@ def _build_parser():
     source.add_argument("--intent-file",
                         help="read the intent from a file, or '-' for stdin: no argv "
                              "size limit, multiline, unicode and quotes survive intact")
+    source.add_argument("--prompt",
+                        help="decompose a raw prompt string into intent + acceptance criteria")
     source.add_argument("--prompt-file",
                         help="decompose a whole prompt (file, or '-' for stdin) into "
                              "intent + acceptance criteria + candidate hypotheses; "
@@ -1671,6 +1900,57 @@ def _build_parser():
                            "checkboxes and plain lines each become one criterion")
     node.add_argument("--intake", action="store_true",
                       help="validate the requested magnet without creating a ledger")
+    node.add_argument("--exploratory", action="store_true",
+                      help="declare the run exploratory: a fix may not begin until "
+                           "candidate solutions are recorded (record-candidates) and "
+                           "one is selected (select-candidate)")
+
+    node = add("record-candidates",
+               "record candidate solutions from an exploration pass (arena, parallel "
+               "agents, manual drafts)")
+    node.add_argument("--run-id", required=True)
+    node.add_argument("--source", required=True, choices=CANDIDATE_SOURCES)
+    node.add_argument("--count", required=True, type=int)
+    node.add_argument("--file", action="extend", nargs="+", default=[],
+                      help="where the candidates live; repeatable")
+    node.add_argument("--note")
+
+    node = add("select-candidate", "record which candidate solution the run pursues")
+    node.add_argument("--run-id", required=True)
+    node.add_argument("--id", required=True)
+    node.add_argument("--by", required=True, choices=("disputed", "author"))
+    node.add_argument("--method", required=True,
+                      help="how the choice was made, e.g. 'arena run r7 winner' "
+                           "or 'rubric scores after review'")
+    node.add_argument("--fork", help="the disputed fork the selection was made on "
+                                     "(required with --by disputed)")
+
+    node = add("one-shot",
+               "the minimal honest sequence for a small, fully reproduced defect in "
+               "one command: init + declare/run loop + one settled hypothesis + "
+               "begin-fix (--search narrow) + evidence. --red-observed must be true.")
+    node.add_argument("--incident", required=True)
+    node.add_argument("--loop-command", required=True,
+                      help="the red-capable command, run on the exact symptom")
+    node.add_argument("--symptom", required=True)
+    node.add_argument("--red-observed", required=True, choices=("true",),
+                      help="the loop must actually have gone red; 'false' has no "
+                           "one-shot path")
+    node.add_argument("--claim", required=True)
+    node.add_argument("--prediction", required=True)
+    node.add_argument("--probe", required=True)
+    node.add_argument("--observed", required=True,
+                      help="what the probe actually showed (green)")
+    node.add_argument("--fix-note", required=True)
+    node.add_argument("--search", default="narrow", choices=tuple(SEARCH_WIDTH))
+    node.add_argument("--evidence-command", required=True)
+    node.add_argument("--evidence-tier", default="executed_here", choices=EVIDENCE_TIERS)
+    node.add_argument("--expected-source", default="literal", choices=EXPECTED_SOURCES)
+    node.add_argument("--evidence-criterion",
+                      help="which criterion the evidence closes; defaults to the first")
+    node.add_argument("--intent", help="used only when the ledger does not exist yet")
+    node.add_argument("--criterion", action="extend", nargs="+", default=[],
+                      help="used only when the ledger does not exist yet")
 
     node = add("freeze-intent", "seal the right edge after init")
 
@@ -1836,13 +2116,19 @@ def _build_parser():
                       help="attempt to restore missing prerequisites by re-running "
                            "recorded provision/injection commands")
 
-    add("status", "print the derived state as JSON")
+    node = add("status", "print the derived state as JSON")
+    node.add_argument("--section", help="limit output to one top-level section (e.g. criteria)")
+    node.add_argument("--criterion", help="show only this criterion and its evidence")
+    node.add_argument("--limit", type=int, help="cap list sections to N rows (default: all)")
     add("next-action", "print what the ledger requires next")
     add("route", "print the pipeline lane and its fallback as JSON")
     add("close", "compute the final status and print the report")
 
     node = add("import-tickets", "map a to-tickets issue directory onto criteria")
     node.add_argument("--tickets", required=True, help="directory of ticket files")
+
+    node = add("import-obligations", "map reverse engineering obligations onto criteria")
+    node.add_argument("--obligations", required=True, help="path to obligations JSON or directory")
     return parser
 
 
@@ -1862,12 +2148,76 @@ def main(argv=None):
         return USAGE
 
 
+def _one_shot(args):
+    """The minimal honest sequence for a small, fully reproduced defect, batched.
+
+    Every step delegates to the same gate-checked Ledger methods the individual
+    commands use — nothing is weakened. What is removed is the ceremony: one
+    invocation instead of eight. --search defaults to narrow, so the disclosure
+    ("fix chosen without a search over rivals") still lands in the report.
+    Idempotent per step: re-running a completed step skips it instead of
+    refusing, so an interrupted batch resumes rather than wedges.
+    """
+    root = Path(args.ledger)
+    if not (root / LOGS["control"]).exists():
+        intent = args.intent or f"fix {args.incident}: {args.symptom}"
+        criteria = list(args.criterion or [])
+        try:
+            Ledger.validate_intent(intent, criteria)
+        except IntakeError as exc:
+            print(json.dumps({"shape_ok": False, "error": str(exc)}, indent=2))
+            return USAGE
+        Ledger.create(root, intent, criteria)
+    ledger = Ledger(root)
+    incident = req(args.incident, "--incident")
+    steps = []
+    if incident not in ledger.state["loops"]:
+        ledger.declare_loop(incident, args.loop_command, args.symptom)
+        steps.append("declare-loop")
+    if not ledger.state["loops"][incident]["ran"]:
+        ledger.run_loop(incident, True)
+        steps.append("run-loop(red=true)")
+    hyp_id = f"{incident}-H1"
+    if hyp_id not in ledger.state["hypotheses"]:
+        ledger.open_hypothesis(hyp_id, incident, args.claim, args.prediction)
+        steps.append("open-hypothesis")
+    if ledger.state["hypotheses"][hyp_id]["status"] == "open":
+        ledger.close_hypothesis(hyp_id, args.probe, args.observed, survives=True)
+        steps.append("survive-hypothesis")
+    ledger.begin_fix(incident, args.fix_note, search=args.search)
+    steps.append(f"begin-fix(--search {args.search})")
+    criterion = args.evidence_criterion or (
+        ledger.state["criteria"][0] if ledger.state["criteria"] else None
+    )
+    if criterion is None:
+        raise UsageError(
+            "no criterion to close: pass --evidence-criterion, or create the ledger "
+            "with --criterion"
+        )
+    ledger.record_evidence(
+        criterion,
+        args.evidence_command,
+        args.evidence_tier,
+        expected_source=args.expected_source,
+    )
+    steps.append(f"record-evidence({criterion!r})")
+    print(json.dumps(
+        {"steps": steps, "next": ledger.next_action()},
+        indent=2, sort_keys=True,
+    ))
+    return OK
+
+
 def _dispatch(args):
     if args.subcommand == "init":
         from prompt import criteria_from_text, load_text, parse_prompt
 
         prompt_shape = None
-        if args.prompt_file:
+        if args.prompt:
+            prompt_shape = parse_prompt(args.prompt)
+            intent = prompt_shape["intent"]
+            criteria = [c["text"] for c in prompt_shape["criteria"]]
+        elif args.prompt_file:
             prompt_shape = parse_prompt(load_text(args.prompt_file))
             intent = prompt_shape["intent"]
             criteria = [c["text"] for c in prompt_shape["criteria"]]
@@ -1888,11 +2238,19 @@ def _dispatch(args):
             except IntakeError as exc:
                 print(json.dumps({"shape_ok": False, "error": str(exc)}, indent=2))
                 return USAGE
+            from prompt import critic_flags, interview_questions
+            questions = interview_questions(validated["intent"], validated["criteria"])
+            critic = critic_flags(validated["intent"], validated["criteria"])
             shape = {
                 "intent": validated["intent"],
                 "criteria": validated["criteria"],
                 "shape_ok": True,
-                "next": "freeze the ledger with init, then drive the loop",
+                "needs_interview": bool(questions or critic),
+                "questions": questions,
+                "critic": critic,
+                "next": ("answer the questions and re-run --intake until needs_interview "
+                           "is false" if questions or critic else
+                           "freeze the ledger with init, then drive the loop"),
             }
             if prompt_shape is not None:
                 shape["criteria_provenance"] = prompt_shape["criteria"]
@@ -1900,7 +2258,10 @@ def _dispatch(args):
                 shape["exclusions"] = prompt_shape["exclusions"]
             print(json.dumps(shape, indent=2))
             return OK
-        Ledger.create(args.ledger, intent, criteria)
+        from prompt import critic_flags
+        critic = critic_flags(intent, criteria)
+        Ledger.create(args.ledger, intent, criteria,
+                      exploratory=getattr(args, "exploratory", False), critic=critic)
         if prompt_shape is not None:
             print(json.dumps({"created": args.ledger, "shape_ok": True,
                               "intent": prompt_shape["intent"],
@@ -1911,6 +2272,9 @@ def _dispatch(args):
         else:
             print(f"initialised {args.ledger}")
         return OK
+
+    if args.subcommand == "one-shot":
+        return _one_shot(args)
 
     ledger = Ledger(args.ledger)
     command = args.subcommand
@@ -1973,6 +2337,19 @@ def _dispatch(args):
             reason=args.reason,
             output_ref=args.output_ref,
         )
+    elif command == "record-candidates":
+        ledger.record_candidates(
+            args.run_id, args.source, args.count,
+            note=args.note, files=args.file,
+        )
+        print(f"recorded {args.count} candidate(s) from {args.source} run {args.run_id!r}")
+        return OK
+    elif command == "select-candidate":
+        ledger.select_candidate(
+            args.run_id, args.id, args.by, args.method, fork=args.fork,
+        )
+        print(f"selected candidate {args.id!r} of run {args.run_id!r} (by {args.by})")
+        return OK
     elif command == "record-risk":
         ledger.record_risk(args.text, args.blocking)
     elif command == "provision-env":
@@ -1998,7 +2375,29 @@ def _dispatch(args):
         print(json.dumps(result, indent=2, sort_keys=True))
         return OK if result["ready"] else BLOCKED
     elif command == "status":
-        print(json.dumps(ledger.state, indent=2, sort_keys=True, default=str))
+        state = ledger.state
+        section = getattr(args, "section", None)
+        criterion = getattr(args, "criterion", None)
+        limit = getattr(args, "limit", None)
+        if criterion:
+            ev = [e for e in state.get("evidence", []) if e.get("criterion") == criterion]
+            latest = ev[-1]["tier"] if ev else None
+            out = {"criterion": criterion,
+                   "verified": latest is not None and latest != "unavailable",
+                   "latest_tier": latest,
+                   "evidence": ev if not limit else ev[:limit]}
+        elif section:
+            if section == "frontier":
+                from derivation import compute_frontier
+                out = {"frontier": compute_frontier(state)}
+            elif section not in state:
+                raise UsageError(f"unknown section {section!r}; top-level keys: {sorted(list(state) + ['frontier'])}")
+            else:
+                val = state[section]
+                out = {section: (val[:limit] if isinstance(val, list) and limit else val)}
+        else:
+            out = state
+        print(json.dumps(out, indent=2, sort_keys=True, default=str))
         return OK
     elif command == "next-action":
         print(json.dumps(ledger.next_action(), indent=2, sort_keys=True))
@@ -2010,6 +2409,11 @@ def _dispatch(args):
         ledger.import_tickets(args.tickets)
         for t in ledger.state["tickets"]:
             print(f"ticket {t['id']}: {t['title']} -> {len(t['criteria'])} criterion/criteria")
+        return OK
+    elif command == "import-obligations":
+        ledger.import_obligations(args.obligations)
+        for o in ledger.state.get("obligations", []):
+            print(f"obligation {o['id']}: {o['title']} -> {len(o['criteria'])} criterion/criteria")
         return OK
     elif command == "freeze-intent":
         ledger.freeze_intent()

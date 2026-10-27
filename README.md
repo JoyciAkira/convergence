@@ -6,7 +6,11 @@ A skill plus the state machine that enforces it. The model-facing contract is
 
 ```bash
 ./scripts/run_tests.sh
+python3 scripts/skill_drift.py   # prose->lib->tests mapping must hold
 ```
+
+Domain glossary: [`CONTEXT.md`](CONTEXT.md). Minimal honest run:
+[`examples/minimal-narrow/run.sh`](examples/minimal-narrow/run.sh).
 
 ## What it is
 
@@ -46,6 +50,13 @@ real trackers — with native ticket ids (`01`, `42`, `ENG-123`) and `Blocked by
 numbers, native keys, titles or tracker URLs, so a GitHub/Linear export imports
 unchanged. The `spec-implement` skill drives the whole loop (import → frontier →
 evidence → close) and is model-invocable, unlike the human-triggered `/implement-spec`.
+
+`import-obligations` maps reverse engineering reconstruction manifests (REA
+bundles, Ghidra export ledgers, clean-room obligation specs) into acceptance
+criteria. Provenance is maintained under `## Reconstruction obligation provenance`,
+distinguishing earned from unproven obligations. Supported `--expected-source`
+expands to `binary_oracle` (differential execution against original binaries)
+and `rea_evidence` (cryptographic Evidence ID reference).
 
 `route` gives a driving pipeline one routable word (`investigate` / `decide` / `unblock`
 / `verify` / `human` / `close`) plus a fallback lane for when the primary one is blocked
