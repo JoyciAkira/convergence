@@ -102,9 +102,12 @@ def parse_obligation_markdown(text: str, filename: str = "") -> list[dict]:
             category = sline[len("**type:**"):].strip()
             continue
         if sline.lower().startswith("**blocked by:**") or sline.lower().startswith("**blocked_by:**"):
-            val = sline.split(":", 1)[1].strip()
+            # The bold field closes with ** after the colon, so strip it before
+            # splitting: otherwise '** none' becomes a dependency named '**'.
+            val = sline.split(":", 1)[1].strip().strip("*").strip()
             if val.lower() != "none":
-                blocked_by = [tok.strip().lstrip("#") for tok in re.split(r"[,\s]+", val) if tok.strip()]
+                tokens = (tok.strip().lstrip("#").strip("*") for tok in re.split(r"[,\s]+", val))
+                blocked_by = [tok for tok in tokens if tok and tok.lower() != "none"]
             continue
         if current_section in _CRITERIA_SECTIONS:
             m_cb = CHECKBOX_RE.match(line)
