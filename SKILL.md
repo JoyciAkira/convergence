@@ -273,6 +273,8 @@ refused: not just identical claims, but any claim in the same incident sharing a
 really are different mechanisms, say what distinguishes them.
 
 A hypothesis you cannot state a prediction for is a vibe. Discard or sharpen it.
+`--rank` numbers the lanes so several agents working one incident claim the next
+rank deterministically instead of racing for the same idea.
 
 ## A3. Test them one variable at a time
 
@@ -340,6 +342,11 @@ $CONVERGENCE one-shot "$LEDGER" --incident INC-1 \
 went red on the exact symptom, not as a shortcut around that fact. Each step is
 idempotent, so an interrupted batch resumes instead of wedging. The default `--search`
 is `narrow` — pass `--search full` the moment the mechanism could be in doubt.
+
+`--evidence-tier` (default `executed_here`) and `--evidence-criterion` (default: the
+run's first criterion) say what the batched evidence lands at and which check it
+closes. The tier is recorded verbatim, so batching never upgrades a claim: a
+`reproduced_independently` argument still needs a second actor.
 
 ---
 
@@ -436,6 +443,11 @@ of not deciding. Then stop that path and keep the run.
 If your decision departs from `--assumed`, `--invalidated` is mandatory. Name the code,
 tests, acceptance criteria and PRD stories the dead assumption made stale. Silence here is
 how work ends up shipped on top of an assumption nobody noticed died.
+
+`--rationale` records why the chosen option won, and `--reversibility`
+(`reversible` / `irreversible`) declares whether it can be undone. When the flag is
+omitted the reversibility is read from the chosen fork option, which is why every
+option must carry one; the authority check above reads that same value.
 
 ### When the dispute wins against you
 
@@ -718,6 +730,20 @@ $CONVERGENCE resolve-block "$LEDGER" \
   --provided "provision-env created neon-db; DATABASE_URL now in environment"
 ```
 
+When you know the dependency by shape but not by command, the catalog fills the
+lookup: `provision-env-catalog` takes a known spec id (`postgres`, `redis`, `sqlite`,
+`s3`, `mail`, `ghidra`, `rizin`, `radare2`, `frida`, `qemu`) and records it against
+the output variable.
+
+```bash
+$CONVERGENCE provision-env-catalog "$LEDGER" --spec postgres --output-var DATABASE_URL
+```
+
+Without `--command` this records the spec's placeholder, **not** a real value:
+`validate-infra` still requires `DATABASE_URL` to exist in the environment, so a
+placeholder can never pass as a provisioned dependency. Unknown spec ids are accepted
+as-is — the catalog is guidance, not a cage.
+
 ## Inject build context into isolated test directories
 
 Generated code tested in `/tmp` produces false negatives because dependencies live
@@ -781,7 +807,9 @@ $CONVERGENCE boot-runtime "$LEDGER" \
 It picks a free port (substituting `{port}` into the command; pass `--port` to pin
 one), polls until something accepts connections, then records the runtime, releases
 the parked block named by `--resolve-signature`, and records `executed_here` listener
-evidence for `--criterion`. The server keeps running so the e2e criteria can be
+evidence for `--criterion`. `--cwd` is where the command runs, `--path` the URL path
+readiness is checked against (default `/`), and `--timeout` the seconds before the
+boot is refused with the log tail. The server keeps running so the e2e criteria can be
 verified against it. Diagnostics land in `runtimes/<name>.log` inside the ledger;
 if the process dies or times out the gate refuses with the log tail.
 
