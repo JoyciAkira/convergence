@@ -12,6 +12,8 @@ import json
 import subprocess
 import sys
 import threading
+import time
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -28,6 +30,7 @@ from convergence import (  # noqa: E402
     UsageError,
     main,
 )
+from compaction import MARKER as COMPACT_MARKER  # noqa: E402
 
 INCIDENT = "INC-1"
 
@@ -1253,6 +1256,74 @@ def test_compact_after_multiprocess_churn_replays_to_the_same_state(tmp_path):
     after = {k: v for k, v in reopened.state.items() if k != "events"}
     assert after == before, "the compacted ledger does not derive the same state"
     assert len(reopened.state["evidence"]) == 8
+
+
+def test_compaction_and_concurrent_writers_are_lossless(tmp_path):
+    """Writers and compactors are separate OS processes; the ledger lock makes
+    every write land exactly once even while a snapshot is being published."""
+    path = tmp_path / "L"
+    Ledger.create(path, "x", ["handles CRLF"])
+    script = tmp_path / "stress_worker.py"
+    script.write_text(textwrap.dedent(r"""
+        import json
+        import sys
+        import time
+        import traceback
+
+        sys.path.insert(0, sys.argv[2])
+        from convergence import Blocked, Ledger
+
+        path, start = sys.argv[1], float(sys.argv[3])
+        kind, index = sys.argv[4], int(sys.argv[5])
+        time.sleep(max(0.0, start - time.time()))
+        successes = 0
+        attempts = 6 if kind == "writer" else 12
+        try:
+            for n in range(attempts):
+                if kind == "writer":
+                    Ledger(path).record_risk(f"stress-{index}-{n}")
+                else:
+                    try:
+                        Ledger(path).compact()
+                        successes += 1
+                    except Blocked:
+                        time.sleep(0.01)
+        except Exception:
+            traceback.print_exc()
+            sys.exit(1)
+        print(json.dumps({"kind": kind, "index": index, "successes": successes}))
+    """), encoding="utf-8")
+
+    start = time.time() + 0.5
+    tasks = [("writer", i) for i in range(6)] + [("compact", i) for i in range(4)]
+    processes = [
+        subprocess.Popen(
+            [sys.executable, str(script), str(path), str(ROOT / "lib"),
+             str(start), kind, str(index)],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for kind, index in tasks
+    ]
+    try:
+        results = [process.communicate(timeout=60) for process in processes]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+
+    compact_successes = 0
+    for (kind, index), process, (stdout, stderr) in zip(tasks, processes, results):
+        assert process.returncode == 0, (kind, index, stdout, stderr)
+        payload = json.loads(stdout.strip())
+        if kind == "compact":
+            compact_successes += payload["successes"]
+
+    expected = {f"stress-{i}-{n}" for i in range(6) for n in range(6)}
+    final = Ledger(path)
+    assert {r["text"] for r in final.state["risks"]} == expected
+    assert len(final.state["risks"]) == len(expected), "a concurrent write was duplicated"
+    assert compact_successes > 0, "no compaction completed under contention"
+    assert not (path / COMPACT_MARKER).exists()
 
 
 # --------------------------------------------------------------------------- #

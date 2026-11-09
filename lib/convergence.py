@@ -6,7 +6,8 @@ Every gate exists because the surrounding skill library states the rule in prose
 then lets the agent skip it.
 
 Layout:
-  * `state`      - replay, transactions, compaction, the frozen right edge
+  * `state`      - replay, transactions, crash recovery, the frozen right edge
+  * `compaction` - atomic log replacement and pending-marker rollback
   * `gates`      - Entry A/C: red loop, hypotheses, fix gate, classification
   * `decide`     - Entry B: forks, adversarial dispute, authority
   * `evidence`   - three tiers, anti-tautology control

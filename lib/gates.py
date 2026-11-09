@@ -255,7 +255,7 @@ class GateMixin:
                 f"--search {search} requires {required}. Test more rivals, or re-run with "
                 f"--search narrow if the defect is fully reproduced and its mechanism is "
                 f"unambiguous: the fix is then recorded as chosen without a search over "
-                f"rivals, and the run can no longer close as a clean COMPLETE."
+                f"rivals, and the report discloses that choice."
             )
         self._append(
             "control",

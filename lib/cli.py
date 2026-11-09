@@ -297,6 +297,15 @@ def _dispatch(args):
         ledger.freeze_intent()
         print(f"intent frozen at {args.ledger}")
         return OK
+    elif command == "compact":
+        compacted = ledger.compact()
+        print(json.dumps({
+            "archive": str(ledger.root / "archive"),
+            "compacted": True,
+            "events": compacted.state["events"],
+            "ledger": str(ledger.root),
+        }, indent=2, sort_keys=True))
+        return OK
     elif command == "close":
         report = ledger.report()
         (ledger.root / "report.md").write_text(report, encoding="utf-8")

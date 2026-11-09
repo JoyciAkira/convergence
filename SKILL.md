@@ -37,8 +37,9 @@ Do NOT activate for a single trivial change (typo, one-line rename with an
 obvious check): the ledger would be theatre there. Use the minimal honest
 sequence only when a check actually went red.
 
-Glossary: [CONTEXT.md](CONTEXT.md). Minimal runnable example:
-[examples/minimal-narrow/run.sh](examples/minimal-narrow/run.sh).
+Glossary: [CONTEXT.md](CONTEXT.md). Runnable examples:
+[examples/minimal-narrow/run.sh](examples/minimal-narrow/run.sh) and
+[examples/clean-room-re/run.sh](examples/clean-room-re/run.sh).
 
 ## The magnet
 
@@ -642,9 +643,23 @@ You may not announce a status the machine did not print, and you may not describ
 ## Ledger maintenance
 
 `LEDGER_VERSION = 2` (see `lib/convergence.py`). Replays refuse corrupt lines
-instead of guessing; `compact()` archives the originals, writes one snapshot,
-and proves the compacted ledger replays to the same state, restoring the
-originals on any divergence. Locks are portable (`fcntl` on POSIX, `msvcrt` on
+instead of guessing; an unterminated final append — a crash mid-write — is not
+a record: the intact prefix still replays, and the torn tail is dropped on the
+next write. A complete record that lost only its newline is kept. The `compact`
+subcommand archives the originals under `<ledger>/archive/`, writes one snapshot,
+and proves the compacted ledger replays to the same state, restoring the originals
+on any divergence. It is a transaction: a pending marker is written before any log
+is truncated, and only after the snapshot replays identically is it removed. If the
+process dies in between, the next open restores the archive, so a crash cannot leave
+a half-compacted ledger. Its JSON output names the ledger, the archive directory and
+the replayed event count:
+
+```bash
+$CONVERGENCE compact "$LEDGER"
+# {"archive": "<ledger>/archive", "compacted": true, "events": N, "ledger": "<ledger>"}
+```
+
+Locks are portable (`fcntl` on POSIX, `msvcrt` on
 Windows) so two agents racing one ledger still yield exactly one winner.
 
 `import-tickets` is idempotent: re-importing the same directory skips identical

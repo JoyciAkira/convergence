@@ -117,6 +117,8 @@ def _build_parser():
 
     node = add("freeze-intent", "seal the right edge after init")
 
+    add("compact", "compact the logs into one snapshot after proving it replays")
+
     node = add("declare-loop", "declare the feedback loop for an incident")
     node.add_argument("--incident", required=True)
     node.add_argument("--command", required=True)
@@ -150,7 +152,8 @@ def _build_parser():
     node.add_argument("--search", default="full", choices=tuple(SEARCH_WIDTH),
                       help="full: search over rival explanations (default). "
                            "narrow: the defect is fully reproduced and its mechanism is "
-                           "unambiguous; the run then cannot close as a clean COMPLETE.")
+                           "unambiguous; the report then discloses the fix was chosen "
+                           "without a search over rivals.")
 
     node = add("classify", "classify a repeated failure signature")
     node.add_argument("--signature", required=True)
@@ -203,7 +206,7 @@ def _build_parser():
     node.add_argument("--rationale")
     node.add_argument("--challenger-overruled", action="store_true",
                       help="the dispute's objection did not hold; requires --override-reason "
-                           "and downgrades the final verdict to COMPLETE WITH RISKS")
+                           "and is disclosed in the report without gating the verdict")
     node.add_argument("--override-reason")
 
     node = add("record-evidence", "record a verification result")

@@ -1,9 +1,9 @@
 """Ledger state: append-only logs, replay, transactions and the magnet's edges.
 
 `StateMixin` owns everything that turns four JSONL files into a replayed state:
-the advisory lock, the transaction, compaction, creation, the frozen intent and the
-delegation to pure derivation. Gates live in `gates`, `decide`, `evidence`,
-`intake`, `infra` and `preflight`.
+the advisory lock, the transaction, crash recovery, creation, the frozen intent
+and the delegation to pure derivation. Atomic compaction lives in `compaction.py`.
+Gates live in `gates`, `decide`, `evidence`, `intake`, `infra` and `preflight`.
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ except ImportError:  # Windows: no fcntl; fall back to msvcrt or no-op lock
     _HAS_FCNTL = False
 
 from comparator import ClaimComparator, JaccardComparator
+from compaction import compact_locked, recover_pending
 from constants import LEDGER_VERSION, LOCK, LOGS
 from derivation import (
     auto_critique as derive_auto_critique,
@@ -128,14 +129,23 @@ def empty_state():
 class StateMixin:
     """Storage, replay and the frozen right edge."""
 
-    def __init__(self, root, runtime_manager: RuntimeManager | None = None, claim_comparator: ClaimComparator | None = None):
+    def __init__(self, root, runtime_manager: RuntimeManager | None = None,
+                 claim_comparator: ClaimComparator | None = None,
+                 _lock_held=False, _recover=True):
         self.root = Path(root)
         self.state = empty_state()
         self.runtime_manager = runtime_manager or RealOSRuntimeManager()
         self.claim_comparator = claim_comparator or JaccardComparator()
         if not self.root.exists():
             raise UsageError(f"ledger directory does not exist: {self.root}")
-        self._replay_all()
+        if _lock_held:
+            if _recover:
+                recover_pending(self.root)
+            self._replay_all()
+        else:
+            # Recovery and replay must see the same locked snapshot as a write.
+            with self.transaction():
+                pass
 
     def _replay_all(self):
         self.state = empty_state()
@@ -154,72 +164,68 @@ class StateMixin:
         with (self.root / LOCK).open("a") as handle:
             _lock_exclusive(handle)
             try:
+                # A crashed compaction may have left half-truncated logs. Restore
+                # its archive before anyone reads or extends them.
+                recover_pending(self.root)
                 self._replay_all()
                 yield
             finally:
                 _unlock(handle)
 
     def compact(self):
-        """Compact the logs into a single snapshot event, losslessly.
-
-        Compaction is only honest if the compacted ledger derives the exact same
-        state. So: replay the logs first and refuse if they disagree with the state
-        this instance holds (someone wrote after we loaded — snapshotting a stale
-        view would be silent data loss), archive the originals, write one snapshot
-        event, and prove the compacted ledger replays to the same state before
-        returning it. On any divergence the originals are restored and the call is
-        refused.
-        """
-        import shutil
-
-        clean = empty_state()
-        for name in ("control", "hypotheses", "forks", "evidence"):
-            self._replay(self.root / LOGS[name], clean)
-        if _comparable(clean) != _comparable(self.state):
-            raise Blocked(
-                "compact refused: replayed state diverges from current state — the "
-                "ledger changed under this process. Re-open and retry."
-            )
-        snapshot = {"ev": "snapshot", "at": time.time(), "state": copy.deepcopy(self.state)}
-        archive = self.root / "archive" / f"{int(time.time() * 1000)}"
-        archive.mkdir(parents=True, exist_ok=True)
-        for name in LOGS.values():
-            path = self.root / name
-            if path.exists():
-                shutil.copy2(path, archive / name)
-                path.write_text("", encoding="utf-8")
-        with (self.root / LOGS["control"]).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(snapshot, sort_keys=True) + "\n")
-        reopened = type(self)(
-            self.root,
-            runtime_manager=self.runtime_manager,
-            claim_comparator=self.claim_comparator,
-        )
-        if _comparable(reopened.state) != _comparable(self.state):
-            for name in LOGS.values():
-                shutil.copy2(archive / name, self.root / name)
-            raise Blocked(
-                "compact refused: the compacted ledger diverges from the original; "
-                "originals restored"
-            )
-        return reopened
+        """Compact under the ledger lock; see `compaction.py` for the transaction."""
+        with (self.root / LOCK).open("a") as handle:
+            _lock_exclusive(handle)
+            try:
+                recover_pending(self.root)
+                return compact_locked(self)
+            finally:
+                _unlock(handle)
 
     def _replay(self, path, state=None):
         target = self.state if state is None else state
         if not path.exists():
             return
-        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+        text = path.read_text()
+        lines = text.splitlines()
+        for lineno, line in enumerate(lines, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError as exc:
+                # A crash can cut the final append before its newline. That
+                # tail was never a record; the intact prefix is the ledger.
+                # A terminated line was written in full, so corruption there
+                # is still refused rather than guessed away.
+                if lineno == len(lines) and not text.endswith("\n"):
+                    break
                 raise UsageError(f"corrupt ledger: {path.name}:{lineno} is not JSON") from exc
             try:
                 apply_event(target, ev)
             except (Blocked, UsageError) as exc:
                 raise UsageError(f"corrupt ledger: {path.name}:{lineno}: {exc}") from exc
+
+    def _repair_tail(self, path):
+        """Repair an interrupted final append before writing after it.
+
+        A torn tail is dropped; a complete record that lost only its newline is
+        kept (a newline is added) so its already-replayed event cannot vanish.
+        """
+        if not path.exists():
+            return
+        data = path.read_bytes()
+        if not data or data.endswith(b"\n"):
+            return
+        tail = data.rsplit(b"\n", 1)[-1]
+        try:
+            json.loads(tail.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            cut = data.rfind(b"\n")
+            path.write_bytes(data[:cut + 1] if cut >= 0 else b"")
+        else:
+            path.write_bytes(data + b"\n")
 
     def _append(self, name, event):
         """Validate against a copy first, so a refusal never reaches the disk."""
@@ -227,6 +233,7 @@ class StateMixin:
         trial = copy.deepcopy(self.state)
         apply_event(trial, event)
         path = self.root / LOGS[name]
+        self._repair_tail(path)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
         self.state = trial
@@ -254,7 +261,7 @@ class StateMixin:
                     )
                 for name in LOGS.values():
                     (root / name).touch()
-                ledger = cls(root)
+                ledger = cls(root, _lock_held=True)
                 ledger._append(
                     "control",
                     {
