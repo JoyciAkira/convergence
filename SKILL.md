@@ -651,7 +651,9 @@ and proves the compacted ledger replays to the same state, restoring the origina
 on any divergence. It is a transaction: a pending marker is written before any log
 is truncated, and only after the snapshot replays identically is it removed. If the
 process dies in between, the next open restores the archive, so a crash cannot leave
-a half-compacted ledger. Its JSON output names the ledger, the archive directory and
+a half-compacted ledger. File and directory entries are fsynced at the commit
+points — the archive, the marker rename and the marker removal — so the marker
+survives a power loss too. Its JSON output names the ledger, the archive directory and
 the replayed event count:
 
 ```bash

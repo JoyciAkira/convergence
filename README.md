@@ -70,7 +70,10 @@ derived state. It is transactional: the originals are archived under
 `<ledger>/archive/<timestamp>/` and a pending marker is published before any log is
 truncated. The marker is removed only after the snapshot replays identically; if the
 process dies before that, the next open restores the archive, so a crash cannot leave
-a half-compacted ledger. A compacted run still resumes with `next-action`.
+a half-compacted ledger. File and directory entries are fsynced at the commit
+points — the archive, the marker rename and the marker removal — so a power loss
+after the marker rename cannot resurrect a transaction that had already been
+cleared. A compacted run still resumes with `next-action`.
 
 Every report closes with `## Auto-critique`: the run names its own weaknesses — unfalsified
 searches, untraceable evidence, verdict-less disputes, overruled dissent, narrow searches,

@@ -2,10 +2,11 @@
 
 A compaction replaces four logs with one snapshot. A crash between truncating a
 log and publishing the snapshot would otherwise lose the run, so the archive is
-written and a pending marker is published before any log is touched. The marker
-is the commit point: while it exists, the next reader restores the archived
-originals. It is removed only after the compacted ledger has replayed to the
-same state.
+written and a pending marker is published before any log is touched. The archive
+files, their directory entries and the marker rename are fsynced, so the commit
+point also survives a power loss. The marker is the commit point: while it exists,
+the next reader restores the archived originals. It is removed only after the
+compacted ledger has replayed to the same state.
 """
 from __future__ import annotations
 
@@ -28,11 +29,31 @@ def _marker_path(root):
     return Path(root) / MARKER
 
 
+def _fsync_dir(path):
+    """Flush a directory so a rename, creation or unlink survives a power loss.
+
+    File fsyncs keep a file's bytes, but directory entries need their own
+    fsync; without it a marker rename or the final marker unlink can vanish
+    even though every file was flushed. Unsupported platforms are tolerated.
+    """
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return
+
+
 def _restore_file(source, target):
     """Replace one log atomically, leaving the marker for a retry on a crash."""
     temporary = target.with_name(target.name + ".recover")
     shutil.copy2(source, temporary)
     os.replace(temporary, target)
+    with target.open("rb") as handle:
+        os.fsync(handle.fileno())
+    _fsync_dir(target.parent)
 
 
 def _archive_file(source, target):
@@ -51,6 +72,7 @@ def _write_marker(root, archive, present):
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, marker)
+    _fsync_dir(root)
 
 
 def recover_pending(root):
@@ -98,7 +120,9 @@ def recover_pending(root):
             _restore_file(source, target)
         elif target.exists():
             target.unlink()
+    _fsync_dir(root)
     marker.unlink()
+    _fsync_dir(root)
     return True
 
 
@@ -126,14 +150,23 @@ def compact_locked(ledger):
     snapshot = {"ev": "snapshot", "at": time.time(), "state": copy.deepcopy(ledger.state)}
     archive = ledger.root / "archive" / str(time.time_ns())
     archive.mkdir(parents=True, exist_ok=True)
+    _fsync_dir(ledger.root)
+    _fsync_dir(archive.parent)
     present = [name for name in LOGS if (ledger.root / LOGS[name]).exists()]
     for name in present:
         _archive_file(ledger.root / LOGS[name], archive / LOGS[name])
+    _fsync_dir(archive)
     _write_marker(ledger.root, archive, present)
     for name in present:
-        (ledger.root / LOGS[name]).write_text("", encoding="utf-8")
+        with (ledger.root / LOGS[name]).open("w", encoding="utf-8") as handle:
+            handle.write("")
+            handle.flush()
+            os.fsync(handle.fileno())
+    _fsync_dir(ledger.root)
     with (ledger.root / LOGS["control"]).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(snapshot, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
     try:
         reopened = type(ledger)(
@@ -153,4 +186,5 @@ def compact_locked(ledger):
             "originals restored"
         )
     _marker_path(ledger.root).unlink()
+    _fsync_dir(ledger.root)
     return reopened

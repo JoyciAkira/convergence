@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 from compaction import MARKER as COMPACT_MARKER  # noqa: E402
+import compaction as compaction_module  # noqa: E402
 import state as state_module  # noqa: E402
 from convergence import Blocked, IntakeError, Ledger, UsageError  # noqa: E402
 from state import req_list  # noqa: E402
@@ -31,16 +32,20 @@ sys.path.insert(0, sys.argv[2])
 from convergence import Ledger
 
 mode = sys.argv[3]
-real_write_text = Path.write_text
+real_open = Path.open
 real_unlink = Path.unlink
 
 if mode == "truncate":
-    def crash_write_text(self, data, *args, **kwargs):
-        result = real_write_text(self, data, *args, **kwargs)
-        if self.name == "control.jsonl" and data == "":
+    def crash_open(self, mode="r", *args, **kwargs):
+        handle = real_open(self, mode, *args, **kwargs)
+        if self.name == "control.jsonl" and mode == "w":
+            handle.write("")
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
             os._exit(37)
-        return result
-    Path.write_text = crash_write_text
+        return handle
+    Path.open = crash_open
 else:
     def crash_unlink(self, *args, **kwargs):
         if self.name == ".compact.pending":
@@ -49,6 +54,25 @@ else:
     Path.unlink = crash_unlink
 
 Ledger(sys.argv[1]).compact()
+"""
+
+
+CRASH_DURING_RECOVERY = r"""
+import os
+import sys
+
+sys.path.insert(0, sys.argv[2])
+import compaction
+from convergence import Ledger
+
+real_restore = compaction._restore_file
+
+def crash_after_first_restore(source, target):
+    real_restore(source, target)
+    os._exit(39)
+
+compaction._restore_file = crash_after_first_restore
+Ledger(sys.argv[1])
 """
 
 
@@ -157,6 +181,60 @@ def test_a_crash_during_compaction_restores_the_originals(tmp_path, mode, code):
     assert not marker.exists(), "recovery must clear the marker only after restoring"
     assert "snapshot" not in (led.root / "control.jsonl").read_text(encoding="utf-8")
     assert not (led.root / "control.jsonl.recover").exists()
+
+
+def test_a_crash_during_recovery_is_idempotent(tmp_path):
+    """A crash halfway through restoring must not consume the archive."""
+    led = Ledger.create(tmp_path / "L", "ship the parser", ["handles CRLF"])
+    led.record_risk("must survive recovery crashes")
+    expected = [r["text"] for r in led.state["risks"]]
+    marker = led.root / COMPACT_MARKER
+
+    crashed = subprocess.run(
+        [sys.executable, "-c", CRASH_DURING_COMPACT, str(led.root),
+         str(ROOT / "lib"), "truncate"],
+        cwd=ROOT, capture_output=True, text=True, timeout=30,
+    )
+    assert crashed.returncode == 37, (crashed.stdout, crashed.stderr)
+    assert marker.exists()
+
+    recovery_crashed = subprocess.run(
+        [sys.executable, "-c", CRASH_DURING_RECOVERY, str(led.root),
+         str(ROOT / "lib")],
+        cwd=ROOT, capture_output=True, text=True, timeout=30,
+    )
+    assert recovery_crashed.returncode == 39, (
+        recovery_crashed.stdout, recovery_crashed.stderr)
+    assert marker.exists(), "an interrupted recovery must keep the marker"
+    archives = list((led.root / "archive").iterdir())
+    assert len(archives) == 1 and (archives[0] / "control.jsonl").exists(), (
+        "the archive must remain available for the next recovery attempt")
+
+    recovered = Ledger(led.root)
+    assert [r["text"] for r in recovered.state["risks"]] == expected
+    assert not marker.exists()
+    assert "snapshot" not in (led.root / "control.jsonl").read_text(encoding="utf-8")
+    assert not (led.root / "control.jsonl.recover").exists()
+
+
+def test_compact_fsyncs_directories_at_commit_points(led, monkeypatch):
+    """A power loss must not resurrect the marker or lose the archive rename."""
+    calls = []
+    original = compaction_module._fsync_dir
+
+    def record(path):
+        calls.append(Path(path))
+        return original(path)
+
+    monkeypatch.setattr(compaction_module, "_fsync_dir", record)
+    led.compact()
+
+    archive_dir = led.root / "archive"
+    assert archive_dir in calls
+    assert any(path.parent == archive_dir for path in calls), (
+        "the timestamped archive directory must be flushed after its files")
+    assert calls.count(led.root) >= 2, (
+        "the ledger root must be flushed for the marker rename and its removal")
 
 
 def test_validate_intent_rejects_a_criterion_that_restates_the_intent():
