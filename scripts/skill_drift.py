@@ -6,6 +6,10 @@ Checks:
   2. Every key refusal theme is implemented somewhere in lib/ and covered
      by at least one behavioural test in tests/.
   3. LEDGER_VERSION is referenced by the prose maintenance section.
+  4. The layout holds: convergence.py is a facade, and the domain modules that
+     own the gates stay under their line caps.
+  5. Every flag the CLI accepts is named in SKILL.md: adding a flag is a change
+     to the contract, and a contract nobody can read is not one.
 
 Exit 0 when everything maps, 1 with a report otherwise.
 """
@@ -57,6 +61,61 @@ def check_frontmatter(prose: str) -> list[str]:
     return problems
 
 
+# module -> maximum lines. convergence.py must stay a facade so a new gate lands in
+# the module that owns it; the other three own the most rule-dense behaviour and are
+# the ones that rot back into a monolith first.
+LAYOUT = {
+    "convergence.py": 150,
+    "cli.py": 400,
+    "gates.py": 400,
+    "state.py": 400,
+}
+
+
+def check_layout() -> list[str]:
+    problems: list[str] = []
+    for name, cap in LAYOUT.items():
+        path = LIB / name
+        if not path.exists():
+            problems.append(f"layout: {name} is missing; convergence.py is a facade over domain modules")
+            continue
+        size = len(_read(path).splitlines())
+        if size > cap:
+            problems.append(
+                f"layout: {name} is {size} lines (cap {cap}) — move the new rule into the module that owns it"
+            )
+    return problems
+
+
+#: Flags the CLI may expose without prose: argparse's own help.
+UNDOCUMENTED_OK = frozenset(("-h", "--help"))
+
+
+def parser_flags() -> set[str]:
+    """Every option string the ledger CLI exposes, subcommands included."""
+    sys.path.insert(0, str(LIB))
+    from cli_parser import _build_parser
+
+    flags: set[str] = set()
+    for action in _build_parser()._actions:
+        flags.update(action.option_strings)
+        choices = getattr(action, "choices", None)
+        if isinstance(choices, dict):
+            for sub in choices.values():
+                for sub_action in sub._actions:
+                    flags.update(sub_action.option_strings)
+    return flags
+
+
+def check_flags(flags: set[str], prose: str) -> list[str]:
+    """A flag nobody documented is a capability the skill cannot be held to."""
+    return [
+        f"drift: CLI flag {flag} is not documented in SKILL.md"
+        for flag in sorted(flags - UNDOCUMENTED_OK)
+        if flag not in prose
+    ]
+
+
 def main() -> int:
     problems: list[str] = []
     prose = _read(SKILL)
@@ -71,6 +130,10 @@ def main() -> int:
         if not any(p.lower() in test_text.lower() for p in test_pats):
             problems.append(f"drift: '{theme}' has no behavioural test coverage")
 
+    problems.extend(check_layout())
+    flags = parser_flags()
+    problems.extend(check_flags(flags, prose))
+
     if "LEDGER_VERSION" not in lib_text:
         problems.append("drift: LEDGER_VERSION missing from lib/")
     if "LEDGER_VERSION" not in prose and "ledger maintenance" not in prose.lower():
@@ -81,7 +144,10 @@ def main() -> int:
         for p in problems:
             print(f"  - {p}")
         return 1
-    print(f"skill-drift: OK ({len(GATES)} refusal themes mapped prose->lib->tests)")
+    print(
+        f"skill-drift: OK ({len(GATES)} refusal themes mapped prose->lib->tests; "
+        f"layout {len(LAYOUT)} caps held; {len(flags)} CLI flags documented)"
+    )
     return 0
 
 

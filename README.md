@@ -6,11 +6,14 @@ A skill plus the state machine that enforces it. The model-facing contract is
 
 ```bash
 ./scripts/run_tests.sh
-python3 scripts/skill_drift.py   # prose->lib->tests mapping must hold
+python3 scripts/skill_drift.py        # prose->lib->tests mapping, layout caps, CLI flags must hold
+python3 scripts/branch_coverage.py    # branch coverage of the pure modules, stdlib only
 ```
 
-Domain glossary: [`CONTEXT.md`](CONTEXT.md). Minimal honest run:
-[`examples/minimal-narrow/run.sh`](examples/minimal-narrow/run.sh).
+Domain glossary: [`CONTEXT.md`](CONTEXT.md). Two runnable examples, each executed by
+`tests/test_examples.py` against a fresh ledger:
+[`examples/minimal-narrow/run.sh`](examples/minimal-narrow/run.sh) and
+[`examples/clean-room-re/run.sh`](examples/clean-room-re/run.sh).
 
 ## What it is
 
@@ -62,6 +65,15 @@ and `rea_evidence` (cryptographic Evidence ID reference).
 / `verify` / `human` / `close`) plus a fallback lane for when the primary one is blocked
 from outside the session. `init --intake` validates the magnet without writing anything;
 `freeze-intent` seals it so the only way to move the right edge is a disputed fork.
+`compact` folds the four logs into one snapshot only after replay proves the same
+derived state. It is transactional: the originals are archived under
+`<ledger>/archive/<timestamp>/` and a pending marker is published before any log is
+truncated. The marker is removed only after the snapshot replays identically; if the
+process dies before that, the next open restores the archive, so a crash cannot leave
+a half-compacted ledger. File and directory entries are fsynced at the commit
+points — the archive, the marker rename and the marker removal — so a power loss
+after the marker rename cannot resurrect a transaction that had already been
+cleared. A compacted run still resumes with `next-action`.
 
 Every report closes with `## Auto-critique`: the run names its own weaknesses — unfalsified
 searches, untraceable evidence, verdict-less disputes, overruled dissent, narrow searches,
@@ -78,15 +90,24 @@ Here a refusal is an exit code:
 | 2 | malformed input |
 | 3 | a gate refused; the reason is on stderr |
 
-`close` derives the final status by precedence — `FAILED VERIFICATION` > `BLOCKED` >
-`COMPLETE WITH RISKS` > `COMPLETE` — and exits non-zero unless the run earned the right to
-call itself finished. It cannot be asserted into existence.
+`close` derives the status from the magnet: `REACHED` only when every criterion carries
+executed, independently-checkable evidence and nothing is open, undecided, parked,
+unrebuilt or blocking; `NOT REACHED` otherwise, and then the run is still going. It
+exits non-zero unless the run earned the right to call itself finished. The status cannot
+be asserted into existence. Disclosures (narrow search, overruled dissent, an
+autonomously authored decision) are reported but do not gate.
 
 ## Tests
 
 `tests/test_convergence.py` is behavioural: every case drives a gate and asserts the
-observable effect. No test asserts on the contents of a source file, so deleting
-behaviour while leaving prose behind turns the suite red. Removing any one of these
+observable effect. `tests/test_cli_contract.py` drives every documented verb and gate
+through a real CLI process and asserts exit `0`/`2`/`3`, so a gate cannot be weakened
+by an in-process shortcut. `tests/test_examples.py` runs both example scripts
+twice in isolated ledgers and requires `REACHED` and exit `0` each time. No test
+asserts on the contents of a source file, so deleting behaviour while leaving prose
+behind turns the suite red. `tests/test_derivation.py`, `tests/test_prompt.py` and
+`tests/test_obligations.py` cover the extracted pure modules directly, and
+`scripts/skill_drift.py` also enforces the layout below. Removing any one of these
 guards fails the suite:
 
 ```
@@ -94,7 +115,33 @@ self-dispute gate · min-3-hypotheses · open-hypothesis-blocks-fix · dispute-b
 irreversibility authority · tautology · criteria-coverage · red-capable loop
 ```
 
+Branch coverage of the pure modules needs no plugin: `scripts/branch_coverage.py` runs
+the suite in-process under `sys.settrace`, covers `derivation`, `prompt`, `obligations`,
+`gates`, `decide` and `state` by default (`--modules` narrows it), and scores
+statement-level decision arms
+(`if`/`elif` both ways, loop body and exit, `try` body and each handler), failing below
+80% per module. `--show-missing` lists the uncovered arms and `--json` is machine
+readable; the script's docstring is the exact definition, since line events cannot
+split one-liners or conditional expressions.
+
 Concurrency is covered at both levels: threads racing through the in-process lock, and
 real OS processes (each CLI invocation is one) racing through `flock` — exactly one
-winner for contested writes, no lost events, and `compact()` proven to replay to the
-same state after multi-process churn.
+winner for contested writes, no lost events, and `compact` proven to replay to the
+same state after multi-process churn. Concurrent writers and compactors are exercised
+together, so a snapshot cannot lose a simultaneous append. Crash replay is covered too:
+an append torn by a crash is treated as an unwritten tail (the intact prefix still
+drives `next-action`), while a terminated corrupt line is refused. Compaction has its
+own crash test: a process killed after truncation and before the snapshot, or after the
+snapshot and before the marker is cleared, is rolled back from the archive on reopen.
+
+## Layout
+
+`lib/convergence.py` is a facade: it re-exports the ledger and the CLI so callers keep
+one import, and holds no gates of its own. The behaviour lives in domain modules —
+`state` (replay, transactions, frozen intent), `compaction` (atomic log replacement
+and crash recovery), `gates` (red loop, hypotheses, fix gate, classification),
+`decide` (forks and dispute), `evidence`,
+`intake`, `infra`, `preflight`, `cli_parser`/`cli` — composed into one `Ledger` in
+`ledger.py`. `scripts/skill_drift.py` fails when the facade grows past 150 lines or
+`cli.py`, `gates.py` or `state.py` grow past 400, so a new rule lands in the module
+that owns it instead of back in the monolith.

@@ -37,8 +37,9 @@ Do NOT activate for a single trivial change (typo, one-line rename with an
 obvious check): the ledger would be theatre there. Use the minimal honest
 sequence only when a check actually went red.
 
-Glossary: [CONTEXT.md](CONTEXT.md). Minimal runnable example:
-[examples/minimal-narrow/run.sh](examples/minimal-narrow/run.sh).
+Glossary: [CONTEXT.md](CONTEXT.md). Runnable examples:
+[examples/minimal-narrow/run.sh](examples/minimal-narrow/run.sh) and
+[examples/clean-room-re/run.sh](examples/clean-room-re/run.sh).
 
 ## The magnet
 
@@ -273,6 +274,8 @@ refused: not just identical claims, but any claim in the same incident sharing a
 really are different mechanisms, say what distinguishes them.
 
 A hypothesis you cannot state a prediction for is a vibe. Discard or sharpen it.
+`--rank` numbers the lanes so several agents working one incident claim the next
+rank deterministically instead of racing for the same idea.
 
 ## A3. Test them one variable at a time
 
@@ -340,6 +343,11 @@ $CONVERGENCE one-shot "$LEDGER" --incident INC-1 \
 went red on the exact symptom, not as a shortcut around that fact. Each step is
 idempotent, so an interrupted batch resumes instead of wedging. The default `--search`
 is `narrow` — pass `--search full` the moment the mechanism could be in doubt.
+
+`--evidence-tier` (default `executed_here`) and `--evidence-criterion` (default: the
+run's first criterion) say what the batched evidence lands at and which check it
+closes. The tier is recorded verbatim, so batching never upgrades a claim: a
+`reproduced_independently` argument still needs a second actor.
 
 ---
 
@@ -436,6 +444,11 @@ of not deciding. Then stop that path and keep the run.
 If your decision departs from `--assumed`, `--invalidated` is mandatory. Name the code,
 tests, acceptance criteria and PRD stories the dead assumption made stale. Silence here is
 how work ends up shipped on top of an assumption nobody noticed died.
+
+`--rationale` records why the chosen option won, and `--reversibility`
+(`reversible` / `irreversible`) declares whether it can be undone. When the flag is
+omitted the reversibility is read from the chosen fork option, which is why every
+option must carry one; the authority check above reads that same value.
 
 ### When the dispute wins against you
 
@@ -630,9 +643,25 @@ You may not announce a status the machine did not print, and you may not describ
 ## Ledger maintenance
 
 `LEDGER_VERSION = 2` (see `lib/convergence.py`). Replays refuse corrupt lines
-instead of guessing; `compact()` archives the originals, writes one snapshot,
-and proves the compacted ledger replays to the same state, restoring the
-originals on any divergence. Locks are portable (`fcntl` on POSIX, `msvcrt` on
+instead of guessing; an unterminated final append — a crash mid-write — is not
+a record: the intact prefix still replays, and the torn tail is dropped on the
+next write. A complete record that lost only its newline is kept. The `compact`
+subcommand archives the originals under `<ledger>/archive/`, writes one snapshot,
+and proves the compacted ledger replays to the same state, restoring the originals
+on any divergence. It is a transaction: a pending marker is written before any log
+is truncated, and only after the snapshot replays identically is it removed. If the
+process dies in between, the next open restores the archive, so a crash cannot leave
+a half-compacted ledger. File and directory entries are fsynced at the commit
+points — the archive, the marker rename and the marker removal — so the marker
+survives a power loss too. Its JSON output names the ledger, the archive directory and
+the replayed event count:
+
+```bash
+$CONVERGENCE compact "$LEDGER"
+# {"archive": "<ledger>/archive", "compacted": true, "events": N, "ledger": "<ledger>"}
+```
+
+Locks are portable (`fcntl` on POSIX, `msvcrt` on
 Windows) so two agents racing one ledger still yield exactly one winner.
 
 `import-tickets` is idempotent: re-importing the same directory skips identical
@@ -718,6 +747,20 @@ $CONVERGENCE resolve-block "$LEDGER" \
   --provided "provision-env created neon-db; DATABASE_URL now in environment"
 ```
 
+When you know the dependency by shape but not by command, the catalog fills the
+lookup: `provision-env-catalog` takes a known spec id (`postgres`, `redis`, `sqlite`,
+`s3`, `mail`, `ghidra`, `rizin`, `radare2`, `frida`, `qemu`) and records it against
+the output variable.
+
+```bash
+$CONVERGENCE provision-env-catalog "$LEDGER" --spec postgres --output-var DATABASE_URL
+```
+
+Without `--command` this records the spec's placeholder, **not** a real value:
+`validate-infra` still requires `DATABASE_URL` to exist in the environment, so a
+placeholder can never pass as a provisioned dependency. Unknown spec ids are accepted
+as-is — the catalog is guidance, not a cage.
+
 ## Inject build context into isolated test directories
 
 Generated code tested in `/tmp` produces false negatives because dependencies live
@@ -781,7 +824,9 @@ $CONVERGENCE boot-runtime "$LEDGER" \
 It picks a free port (substituting `{port}` into the command; pass `--port` to pin
 one), polls until something accepts connections, then records the runtime, releases
 the parked block named by `--resolve-signature`, and records `executed_here` listener
-evidence for `--criterion`. The server keeps running so the e2e criteria can be
+evidence for `--criterion`. `--cwd` is where the command runs, `--path` the URL path
+readiness is checked against (default `/`), and `--timeout` the seconds before the
+boot is refused with the log tail. The server keeps running so the e2e criteria can be
 verified against it. Diagnostics land in `runtimes/<name>.log` inside the ledger;
 if the process dies or times out the gate refuses with the log tail.
 

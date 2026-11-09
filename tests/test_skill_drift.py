@@ -28,6 +28,25 @@ def test_frontmatter_has_triggers_and_hint():
     assert "argument-hint:" in head
 
 
+def test_flag_guard_requires_documentation():
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import skill_drift
+
+    problems = skill_drift.check_flags(
+        {"--documented", "--brand-new"}, "only --documented is named here"
+    )
+    assert any("--brand-new" in problem for problem in problems)
+    assert not any("--documented" in problem for problem in problems)
+
+
+def test_every_cli_flag_is_documented():
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import skill_drift
+
+    prose = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+    assert skill_drift.check_flags(skill_drift.parser_flags(), prose) == []
+
+
 def test_skill_drift_guard_passes():
     r = subprocess.run([sys.executable, "scripts/skill_drift.py"], cwd=ROOT, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
